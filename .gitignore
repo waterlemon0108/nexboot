@@ -1,0 +1,40 @@
+bin/
+node_modules/
+web/node_modules/
+/web/dist/
+/dist/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.env
+*.env
+.env.*
+!.env.example
+!.env.*.example
+*.log
+coverage.out
+.DS_Store
+.cache/
+
+# Python 字节码：e2e 矩阵跑一次就会生成，不该进版本库
+__pycache__/
+*.pyc
+
+# e2e 现场配置（含口令），只提交 env.example
+tools/e2e/run/env
+tools/e2e/__pycache__/
+
+# 根目录的构建产物（正规产物在 bin/ 下）
+/ndiskless
+
+# Public documentation is limited to the image assets.
+/docs/*
+!/docs/images/
+/AGENTS.md
+/CLAUDE.md

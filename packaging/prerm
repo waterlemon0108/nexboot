@@ -1,0 +1,13 @@
+#!/bin/sh
+# Runs before the package is removed. Stop and disable the service so nothing is
+# left pointing at a binary that is about to vanish. On an upgrade ($1 = upgrade)
+# leave it alone — the new package's postinst handles that path, and stopping
+# here would drop clients mid-upgrade for no reason.
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+  systemctl stop ndiskless 2>/dev/null || true
+  systemctl disable ndiskless 2>/dev/null || true
+fi
+
+exit 0

@@ -1,0 +1,16 @@
+[Unit]
+Description=ndiskless - diskless boot control plane
+# 池要先导入，LIO 内核模块要先在：没有它们启动就是带着一半的手脚。
+After=network-online.target zfs-import.target zfs.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/ndiskless/ndiskless.env
+ExecStart=/opt/ndiskless/ndiskless
+# Restart=always 不是运维洁癖，是 HA 的机制本身：角色切换 = 写标记文件
+# 后主动退出，由这里拉起成新角色。去掉它，切换就停在退出那一步。
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

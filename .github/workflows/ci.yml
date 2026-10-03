@@ -1,0 +1,76 @@
+name: CI
+
+# 质量门：任何一步失败就整体失败。
+#
+# 跑的是 Makefile 里的 verify / verify-web，和本地提交前该跑的完全同一条链——
+# 两边同一个入口，才不会出现「本地过了、CI 挂了」或者反过来。
+#
+# 这里**不跑 e2e**：那些矩阵要真实的 ZFS 池、LIO、keepalived 和多台机器，
+# 不是 CI runner 能提供的。跑法见 tools/e2e/README.md，结果人工归档。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt / vet / test / 静态构建
+        run: make verify
+      - name: 覆盖率（只报数，不设闸）
+        run: |
+          go test ./... -coverprofile=coverage.out >/dev/null 2>&1 || true
+          go tool cover -func=coverage.out | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ndiskless-linux-amd64
+          path: bin/ndiskless-linux-amd64
+          if-no-files-found: error
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.2'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: vitest / vite build
+        run: make verify-web
+
+  # 交付物是一个静态二进制 + 内嵌前端。发布时把两边产物合起来，
+  # 标签指向的那个提交就是可回滚的基线。
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 版本号来自 git describe，浅克隆看不全 tag 历史——描述出来的
+          # 版本会退化成裸哈希，发布件上的版本号就和 tag 对不上了。
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with: { node-version: '22.22.2', cache: npm, cache-dependency-path: web/package-lock.json }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod, cache: true }
+      - run: make build-static
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: bin/ndiskless-linux-amd64
+          generate_release_notes: true

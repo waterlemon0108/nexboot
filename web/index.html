@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>NexBoot · 无盘终端平台</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%2300E0FF'/><stop offset='1' stop-color='%231A6DFF'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='%230D1B2E'/><polygon points='32,5 55.4,18.5 55.4,45.5 32,59 8.6,45.5 8.6,18.5' fill='none' stroke='url(%23g)' stroke-width='4' stroke-linejoin='round'/><path d='M32 15 L19 27 M32 15 L45 27 M19 27 L32 33 M45 27 L32 33' fill='none' stroke='%234DA3FF' stroke-width='1.6' stroke-dasharray='2.2 2.2'/><circle cx='32' cy='15' r='3.2' fill='%234DA3FF' stroke='%23fff' stroke-width='1.3'/><circle cx='19' cy='27' r='2.8' fill='%234DA3FF' stroke='%23fff' stroke-width='1.3'/><circle cx='45' cy='27' r='2.8' fill='%234DA3FF' stroke='%23fff' stroke-width='1.3'/><path d='M32 19 L23.5 29 L28.5 29 L28.5 44 L35.5 44 L35.5 29 L40.5 29 Z' fill='url(%23g)'/><rect x='15' y='45' width='34' height='10' rx='3' fill='%23E9F0F8'/><rect x='19.5' y='49' width='14' height='2' rx='1' fill='%230D1B2E'/><circle cx='43' cy='50' r='1.7' fill='%230D1B2E'/></svg>" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Favicon is inline SVG (the brand mark) for the same air-gapped reason as below.
+         No webfont CDN: this console runs on an air-gapped LAN, so a
+         render-blocking fonts.googleapis.com stylesheet only ever stalls first
+         paint until DNS times out, and the fonts never arrive. Typography comes
+         from the platform stacks in styles.css instead. -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

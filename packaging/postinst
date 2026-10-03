@@ -1,0 +1,24 @@
+#!/bin/sh
+# Runs after files are unpacked. It reloads systemd so the unit is known, and
+# stops there — DELIBERATELY. Enabling or starting now would boot a service
+# with no env file (no pool, no bootstrap password), which crash-loops. The
+# operator runs `ndiskless-configure` next; that writes the env and starts it.
+#
+# On an UPGRADE the service may already be configured and running. We do not
+# restart it here either: across an HA pair a blind restart ignores role order
+# (standby before active). Tell the operator to restart deliberately.
+set -e
+
+systemctl daemon-reload || true
+
+if systemctl is-enabled --quiet ndiskless 2>/dev/null; then
+  echo "ndiskless: upgraded. Restart when ready — on an HA pair, the standby"
+  echo "           node first, then the active: systemctl restart ndiskless"
+else
+  echo "ndiskless: installed. Configure and start it with:"
+  echo "           sudo ndiskless-configure --bootstrap-password '<password>' \\"
+  echo "                  --create-pool tank --pool-disks /dev/sdX"
+  echo "           (add --peer/--vip/--cluster-token/--chap-secret for an HA pair)"
+fi
+
+exit 0

@@ -1,0 +1,72 @@
+# ndiskless 双机热备的 keepalived 配置模板（issue 046）。
+# 由 scripts/install-go.sh --peer/--vip 填充下列占位符后写入
+# /etc/keepalived/keepalived.conf：
+#   @IFACE@        客户机网卡（VRRP 心跳与 VIP 同网卡：与服务共命运，
+#                  被隔离的节点也服务不了任何客户机，天然消解大部分脑裂）
+#   @VIP@          虚 IP（客户机的 DHCP/TFTP/boot/iSCSI 都指向它）
+#   @SELF_IP@      本机在该网卡上的真实地址
+#   @PEER_IP@      其余所有节点的真实地址，一行一个（单播：机房交换机常过滤组播）。
+#                  所有节点都进这张表：能不能接管取决于能不能拿到 VIP，而
+#                  「承载哪些客户机的盘」是放置管的事，两者正交。把一台节点排除在
+#                  VRRP 之外，就造出了一台界面上看着是备机、实际永远顶不上的机器。
+#   @AUTH_PASS@    VRRP 口令（防误配的第三台设备搅局，8 字符上限）
+#   @PRIORITY@     优先级：主机 150；备机 100 起，按地址排序逐台加一。
+#                  组建集群时新装的空节点必须输给有数据的那台——它赢了就会
+#                  把空目录复制给对方。备机之间也必须分出高下：三台以上时
+#                  两个备机若同分，VRRP 挑不出赢家，会有一瞬两边都自认
+#                  MASTER，各自激活、各自起 dnsmasq，还拿到同一个 epoch。
+#
+# 角色决定档位（主机 150 / 备机 100+）+ nopreempt：同时启动时有数据的
+# 主机赢；已经有 MASTER 时谁也不抢，故障切换后旧主回归不会多断一次。
+# 计划回切走产品的「计划切换」。
+
+global_defs {
+    script_user root
+    enable_script_security
+}
+
+vrrp_script ndiskless_health {
+    script "/etc/keepalived/ndiskless-check.sh"
+    interval 2
+    timeout 5      # 必须大于探针最坏耗时（2.5s），否则脚本被杀=误判故障
+    fall 2      # 连续 2 次失败才让出：健康检查抖一下不该搬走 VIP
+    rise 2
+}
+
+vrrp_instance ndiskless {
+    state BACKUP            # 双方都从 BACKUP 起，谁健康谁上
+    interface @IFACE@
+    virtual_router_id 66
+    priority @PRIORITY@     # 主机 150；备机 100 起按地址排序递增，不得同分
+    advert_int 1
+    nopreempt
+
+    unicast_src_ip @SELF_IP@
+    unicast_peer {
+        @PEER_IP@
+    }
+
+    authentication {
+        auth_type PASS
+        auth_pass @AUTH_PASS@
+    }
+
+    virtual_ipaddress {
+        @VIP@
+    }
+
+    # 接管时客户机与交换机的 ARP 表还指着旧主的 MAC；不主动刷新就要等
+    # ARP 老化，白白加长切换时间。
+    garp_master_delay 1
+    garp_master_repeat 5
+    garp_master_refresh 30
+
+    track_script {
+        ndiskless_health
+    }
+
+    notify_master "/etc/keepalived/ndiskless-notify.sh master"
+    notify_backup "/etc/keepalived/ndiskless-notify.sh backup"
+    notify_fault  "/etc/keepalived/ndiskless-notify.sh fault"
+    notify_stop   "/etc/keepalived/ndiskless-notify.sh stop"
+}
