@@ -53,12 +53,15 @@ jobs:
       - name: vitest / vite build
         run: make verify-web
 
-  # 交付物是一个静态二进制 + 内嵌前端。发布时把两边产物合起来，
+  # 交付物是静态二进制（内嵌前端）和装它的 .deb（README 快速开始用的就是 apt install .deb）。
   # 标签指向的那个提交就是可回滚的基线。
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [backend, frontend]
     runs-on: ubuntu-latest
+    # 创建 Release、上传附件要写权限；仓库默认给的令牌常是只读，不声明会 403。
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,8 +72,12 @@ jobs:
         with: { node-version: '22.22.2', cache: npm, cache-dependency-path: web/package-lock.json }
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod, cache: true }
-      - run: make build-static
+      # deb 依赖 build-static，一条命令出两样；dpkg-deb 在 ubuntu runner 上自带。
+      - run: make deb
       - uses: softprops/action-gh-release@v2
         with:
-          files: bin/ndiskless-linux-amd64
+          files: |
+            bin/ndiskless-linux-amd64
+            dist/ndiskless_*.deb
+          fail_on_unmatched_files: true
           generate_release_notes: true
