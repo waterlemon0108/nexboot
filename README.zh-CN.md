@@ -95,6 +95,7 @@
 | 磁盘 | 系统盘之外至少一块**独立数据盘**用于 ZFS 存储池 |
 | 内存 | 最低 8 GB，推荐 32 GB 以上（按常用镜像总量能放进 ZFS ARC 估算） |
 | 网络 | 与客户机处于**同一二层网段**；集群各节点也须在该网段（VRRP 心跳经此网卡） |
+| IP 地址 | 每台服务器都要用**静态 IP**，不能用 DHCP |
 | 运行依赖 | `dnsmasq`、`dnsmasq-utils`、`qemu-utils`、`targetcli-fb`、`zfsutils-linux`、`keepalived`、`curl`（deb 包自动拉取，离线包已内置） |
 
 **网络环境**

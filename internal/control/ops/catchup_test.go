@@ -137,6 +137,29 @@ func TestCatchUpGivesUpOnADatasetWithNothingInCommon(t *testing.T) {
 	_ = fmt.Sprint
 }
 
+// 重建被打断后重启，库副本数据集会被 EnsureDBCopyDataset 新建成没有快照的空壳。
+// 它没有可保留的内容，删掉重收即可，不能让整轮追平失败、退回整份重建。
+func TestCatchUpReplacesAnEmptyShellDataset(t *testing.T) {
+	sender := inv("data/nd",
+		[]string{"", "rep-1=r1", "rep-2=r2"},
+		[]string{"/db", "rep-1=d1", "rep-2=d2"},
+		[]string{"/img", "0=i0", "rep-1=i1", "rep-2=i2"},
+	)
+	local := inv("tank/nd",
+		[]string{"", "rep-1=r1"},
+		[]string{"/db"},
+		[]string{"/img", "0=i0", "rep-1=i1"},
+	)
+	plan, err := planCatchUp(sender, "data/nd", local, "tank/nd", "rep-2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "destroy /db; full /db to rep-1; incremental /db rep-1→rep-2; incremental /img rep-1→rep-2; incremental (根) rep-1→rep-2"
+	if got := steps(plan); got != want {
+		t.Fatalf("plan =\n%s\nwant\n%s", got, want)
+	}
+}
+
 // CompleteMarker 只在每个数据集都带着根的最新标记时才算数（递归流失败时根先落地）。
 func TestCompleteMarkerRequiresEveryDatasetToHoldIt(t *testing.T) {
 	whole := inv("tank/nd",

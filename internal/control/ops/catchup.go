@@ -168,7 +168,10 @@ func planCatchUp(sender zfs.GUIDInventory, senderRoot string, local zfs.GUIDInve
 				continue
 			}
 			progressed = true
-			if ld, have := l[rel]; have {
+			if ld, have := l[rel]; have && len(ld.snaps) == 0 {
+				// 没有快照的空壳（如重启时新建的库副本数据集）没有可保留的内容，删掉重收。
+				plan = append(plan, catchUpStep{Kind: "destroy", Rel: rel})
+			} else if have {
 				common := latestCommon(d, ld)
 				if common == nil {
 					return nil, fmt.Errorf("%s 与对端没有共同快照", rel)
@@ -248,6 +251,9 @@ func originHeld(origin string, s, l map[string]*catalogueDataset, present map[st
 	return true // 本轮前面的步骤会把它连同这个快照一起建出来
 }
 
+// errCatchUpInterrupted 标记追平因传输中断而失败（取不到流、流中途断开），下一轮重试即可，不必整体重建。
+var errCatchUpInterrupted = errors.New("追平被传输中断")
+
 // catchUp 在递归轮被拒后逐数据集追到 target。被拒的接收可能已推进部分数据集
 // 并留下续传状态，所以先清续传再重新读本机清单。
 func (r *Replicator) catchUp(ctx context.Context, peerInv ha.ReplicationInventory, base, target string) error {
@@ -279,11 +285,14 @@ func (r *Replicator) catchUp(ctx context.Context, peerInv ha.ReplicationInventor
 		}
 		stream, err := r.Peer.StreamDataset(ctx, step.Rel, step.From, step.Origin, step.To)
 		if err != nil {
-			return fmt.Errorf("%s: %w", step, err)
+			return fmt.Errorf("%s: %w: %w", step, errCatchUpInterrupted, err)
 		}
 		err = r.ZFS.ReceiveDataset(ctx, r.Root+step.Rel, stream)
 		stream.Close()
 		if err != nil {
+			if zfs.IsStreamBroken(err) {
+				return fmt.Errorf("%s: %w: %w", step, errCatchUpInterrupted, err)
+			}
 			return fmt.Errorf("%s: %w", step, err)
 		}
 	}

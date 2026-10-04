@@ -287,8 +287,9 @@ function PageImages() {
   // 导出到服务器目录：结果里带着落在哪台、哪个路径，直接告诉运维。
   const doExportToDir = async () => {
     if (!selImage) return;
-    const r = await run(() => api.exportImage(selImage.ID), null, { errMsg: "导出失败" });
-    if (r) {
+    let r;
+    const ok = await run(async () => (r = await api.exportImage(selImage.ID)), null, { errMsg: "导出失败" });
+    if (ok) {
       store.toast(`已开始导出到 ${r.node || "当前主机"} 的 ${r.path}`, "ok");
       setModal("image");
     }

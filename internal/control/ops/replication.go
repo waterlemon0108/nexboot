@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -301,6 +302,16 @@ func (r *Replicator) PullFrom(ctx context.Context, peer ReplicationPeer, url str
 }
 
 func (r *Replicator) pull(ctx context.Context) error {
+	// 重建残留在这里统一回收，被重启打断的重建也由之后的轮次收掉。同步到目标后都已没用；
+	// 没同步成时留最新一份供人工恢复。
+	synced := false
+	defer func() {
+		keep := asideCopiesKept
+		if synced {
+			keep = 0
+		}
+		r.pruneAsideCopies(ctx, keep)
+	}()
 	// forceRebuild：半截状态废不掉，副本无法再增量，拿到对端目标标记后整体重建。
 	forceRebuild := false
 	if dataset, token, err := r.ZFS.ResumeToken(ctx, r.Root); err == nil && token != "" {
@@ -351,11 +362,17 @@ func (r *Replicator) pull(ctx context.Context) error {
 			"抢到了主机身份——查一下主机那台有没有镜像，若确实是空节点抢主，"+
 			"在正确的主机上执行计划切换后再让本机复制", r.PeerURL)
 	}
+	if r.dropStaleRecvTemps(ctx, peerInv, local) {
+		if local, err = r.ZFS.ListGUIDs(ctx, r.Root); err != nil {
+			return err
+		}
+	}
 	// 放在两道护栏之后：废不掉令牌而整体重建，同样不能跟随异常或空的写入者。
 	if forceRebuild {
 		if err := r.rebuildWhole(ctx, target); err != nil {
 			return err
 		}
+		synced = true
 		r.recordState(ctx, target, nil)
 		return nil
 	}
@@ -367,6 +384,7 @@ func (r *Replicator) pull(ctx context.Context) error {
 		// 同步要求对端每个数据集本机都有，且对端打了标记的数据集本机也带着该标记。
 		behind := datasetsWithoutMarker(peerInv, local, r.Root, target)
 		if datasetsComplete(peerInv, local, r.Root) && len(behind) == 0 {
+			synced = true
 			r.recordState(ctx, target, nil) // 已同步，只刷新心跳
 			return nil
 		}
@@ -374,6 +392,7 @@ func (r *Replicator) pull(ctx context.Context) error {
 		if err == nil {
 			r.logf("copy held the newest marker but not all of the round; caught up dataset by dataset", "marker", target, "behind", strings.Join(behind, ","))
 			r.confirm(ctx, target)
+			synced = true
 			r.recordState(ctx, target, nil)
 			return nil
 		}
@@ -382,6 +401,7 @@ func (r *Replicator) pull(ctx context.Context) error {
 		if divergence, err = r.rebuildAfterCatchUp(ctx, err, target); err != nil {
 			return err
 		}
+		synced = true
 		r.recordState(ctx, target, divergence)
 		return nil
 	}
@@ -410,6 +430,7 @@ func (r *Replicator) pull(ctx context.Context) error {
 			if err := r.rebuildWhole(ctx, target); err != nil {
 				return err
 			}
+			synced = true
 			r.recordState(ctx, target, nil)
 			return nil
 		}
@@ -438,12 +459,13 @@ func (r *Replicator) pull(ctx context.Context) error {
 			r.logf("incremental round not receivable; caught up dataset by dataset", "base", base, "target", target, "error", err)
 			r.confirm(ctx, target)
 		} else {
-			r.logf("incremental replication not receivable; rebuilding the copy from scratch", "base", base, "error", err, "catch_up", cerr.Error())
+			r.logf("incremental replication not receivable and catching up failed", "base", base, "error", err, "catch_up", cerr.Error())
 			if divergence, err = r.rebuildAfterCatchUp(ctx, cerr, target); err != nil {
 				return err
 			}
 		}
 	}
+	synced = true
 	r.recordState(ctx, target, divergence)
 	return nil
 }
@@ -460,6 +482,10 @@ func rollbackDivergence(own []string, aside string) error {
 // rebuildAfterCatchUp 在追平失败后整体重建，返回要挂出的分叉告警。追平因本机自写的还原点被拒时
 // 不能走 rebuildWhole：它成功后会删掉挪开的副本，那些还原点就静默没了，所以改为保留成 -diverged-。
 func (r *Replicator) rebuildAfterCatchUp(ctx context.Context, cerr error, target string) (divergence error, err error) {
+	// 传输中断下一轮换个目标重试即可；升级成整体重建会丢掉已经追平的进度。
+	if errors.Is(cerr, errCatchUpInterrupted) {
+		return nil, cerr
+	}
 	var diverged catchUpDivergedError
 	if !errors.As(cerr, &diverged) {
 		return nil, r.rebuildWhole(ctx, target)
@@ -474,7 +500,34 @@ func (r *Replicator) rebuildAfterCatchUp(ctx context.Context, cerr error, target
 	return rollbackDivergence(diverged.own, aside), nil
 }
 
-// asideCopiesKept 是保留的重建残留副本数。每次失败的重建都会留下一份，不回收会把池写满，
+// recvTempName 是 libzfs 接收 -R 流时给同名冲突数据集起的临时名（recv-<pid>-<seq>）。
+var recvTempName = regexp.MustCompile(`^recv-\d+-\d+$`)
+
+// dropStaleRecvTemps 删掉被打断的接收留下的临时数据集，返回是否删过。它会挂在别的数据集的挂载点上，
+// 让之后每轮增量和重建改名都报 busy。拉取是单飞的，轮开始时还在的只能是残留；写入者有同名数据集的不动。
+func (r *Replicator) dropStaleRecvTemps(ctx context.Context, peerInv ha.ReplicationInventory, local zfs.GUIDInventory) bool {
+	peerHas := map[string]bool{}
+	for _, e := range peerInv.Entries {
+		peerHas[strings.TrimPrefix(e.Name, peerInv.Root)] = true
+	}
+	dropped := false
+	for _, e := range local.Entries {
+		if strings.Contains(e.Name, "@") || !recvTempName.MatchString(filepath.Base(e.Name)) ||
+			peerHas[strings.TrimPrefix(e.Name, r.Root)] {
+			continue
+		}
+		_ = r.ZFS.DetachMounts(ctx, e.Name)
+		if err := r.ZFS.Destroy(ctx, e.Name); err != nil {
+			r.logf("could not remove a temporary dataset left by an interrupted receive", "dataset", e.Name, "error", err)
+			continue
+		}
+		r.logf("removed a temporary dataset left by an interrupted receive", "dataset", e.Name)
+		dropped = true
+	}
+	return dropped
+}
+
+// asideCopiesKept 是没同步成时保留的重建残留副本数。每次失败的重建都会留下一份，不回收会把池写满，
 // 池满又让下一次接收必然失败。留最新一份足够人工恢复。
 const asideCopiesKept = 1
 
@@ -487,17 +540,13 @@ func (r *Replicator) rebuildWhole(ctx context.Context, target string) error {
 				return fmt.Errorf("清空本机的空目录以便重收失败: %w", drop)
 			}
 		}
-		if err := r.receiveRound(ctx, "", target); err != nil {
-			return err
-		}
-		r.pruneAsideCopies(ctx)
-		return nil
+		return r.receiveRound(ctx, "", target)
 	}
 	return r.rebuildPreserving(ctx, target)
 }
 
 // pruneAsideCopies 回收较旧的重建残留副本。尽力而为：删不掉只占空间，不影响正确性。
-func (r *Replicator) pruneAsideCopies(ctx context.Context) {
+func (r *Replicator) pruneAsideCopies(ctx context.Context, keep int) {
 	all, err := r.ZFS.ListAsideCopies(ctx, r.Root)
 	if err != nil {
 		return
@@ -509,10 +558,10 @@ func (r *Replicator) pruneAsideCopies(ctx context.Context) {
 			aside = append(aside, name)
 		}
 	}
-	if len(aside) <= asideCopiesKept {
+	if len(aside) <= keep {
 		return
 	}
-	for _, old := range aside[:len(aside)-asideCopiesKept] {
+	for _, old := range aside[:len(aside)-keep] {
 		if err := r.ZFS.Destroy(ctx, old); err != nil {
 			r.logf("旧的挪开副本没能回收（占着空间，不影响正确性）", "aside", old, "error", err)
 			continue
@@ -538,14 +587,12 @@ func (r *Replicator) rebuildPreserving(ctx context.Context, target string) error
 		// 残片不能用，而本机随时可能被提升，所以删掉残片、放回完整副本，代价是放弃这次的续传令牌。
 		if inv, lerr := r.ZFS.ListGUIDs(ctx, r.Root); lerr == nil && len(inv.Entries) > 0 {
 			if drop := r.ZFS.Destroy(ctx, r.Root); drop != nil {
-				r.pruneAsideCopies(ctx)
 				return fmt.Errorf("重建失败，且收到一半的残片挡住了原名：本机目录暂存于 %s，"+
 					"请人工删除 %s 后把它改回原名（原因：%w）", aside, r.Root, err)
 			}
 		}
 		if back := r.ZFS.Rename(ctx, aside, r.Root); back != nil {
-			// 改不回去，这份就此孤立；每轮一份，所以这里必须回收旧的。
-			r.pruneAsideCopies(ctx)
+			// 改不回去，这份就此孤立；旧的由 pull 回收。
 			return fmt.Errorf("重建失败且未能改回原名：本机目录暂存于 %s，请人工确认后改回 %s（原因：%w）",
 				aside, r.Root, err)
 		}
@@ -556,7 +603,6 @@ func (r *Replicator) rebuildPreserving(ctx context.Context, target string) error
 		r.logf("rebuilt copy is in place but the old one could not be removed",
 			"leftover", aside, "error", err)
 	}
-	r.pruneAsideCopies(ctx)
 	return nil
 }
 

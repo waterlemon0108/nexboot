@@ -724,3 +724,57 @@ func TestBookkeepingWritesDoNotLookLikeACatalogueChange(t *testing.T) {
 		t.Fatal("业务数据写入必须计数")
 	}
 }
+
+// 池容量和告警数值每轮都会刷新，计入变更的话空闲集群每轮都要复制；它们随下一次真实写入一起送到备机即可。
+// 盘、布局、告警级别和状态的变化仍要计入。
+func TestStatusRefreshDoesNotLookLikeACatalogueChange(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.Servers().Create(ctx, domain.Server{ID: "node-1", Name: "node-1", Role: "all", Status: "up"}); err != nil {
+		t.Fatal(err)
+	}
+	pool := domain.Pool{ID: "pool-1", ServerID: "node-1", Name: "tank", Disks: []string{"/dev/sdb"}, Capacity: 100, Used: 10}
+	if err := st.Pools().Create(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	pool, _ = st.Pools().Get(ctx, "pool-1") // 调用方都是读出来再改
+	now := time.Now().UTC()
+	alarm := domain.Alarm{ID: "al-1", AlarmKey: "k", Severity: "warn", Type: "replication_lag", Source: "service",
+		Resource: "node-2", Value: "60", Status: "active", Message: "60 秒未同步", CreatedAt: now, UpdatedAt: now}
+	if err := st.Alarms().Create(ctx, alarm); err != nil {
+		t.Fatal(err)
+	}
+
+	before := st.Revision()
+	pool.Used, pool.Capacity = 11, 101
+	if err := st.Pools().Update(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	alarm.Value, alarm.Message, alarm.UpdatedAt = "90", "90 秒未同步", now.Add(time.Minute)
+	if err := st.Alarms().Update(ctx, alarm); err != nil {
+		t.Fatal(err)
+	}
+	if st.Revision() != before {
+		t.Fatalf("只刷新容量和告警数值推高了变更计数 %d→%d", before, st.Revision())
+	}
+	got, err := st.Pools().Get(ctx, "pool-1")
+	if err != nil || got.Used != 11 {
+		t.Fatalf("不计数也要真的写进库：%+v %v", got, err)
+	}
+
+	pool.Disks = []string{"/dev/sdb", "/dev/sdc"}
+	if err := st.Pools().Update(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if st.Revision() == before {
+		t.Fatal("池的盘变了必须计入")
+	}
+	before = st.Revision()
+	alarm.Severity = "error"
+	if err := st.Alarms().Update(ctx, alarm); err != nil {
+		t.Fatal(err)
+	}
+	if st.Revision() == before {
+		t.Fatal("告警级别变了必须计入")
+	}
+}

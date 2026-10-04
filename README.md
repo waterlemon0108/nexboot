@@ -102,6 +102,7 @@ More screenshots are in the [Chinese README](README.zh-CN.md#演示图).
 | Disks | At least one disk besides the system disk, for the ZFS pool |
 | Memory | 8 GB minimum, 32 GB or more recommended (enough ZFS ARC for your hot images) |
 | Network | Same layer-2 segment as the clients; cluster nodes share it too (VRRP runs there) |
+| IP address | Every server needs a **static IP**, not DHCP |
 | Packages | `dnsmasq`, `dnsmasq-utils`, `qemu-utils`, `targetcli-fb`, `zfsutils-linux`, `keepalived`, `curl` (pulled in by the `.deb`, bundled in the offline package) |
 
 **Network**

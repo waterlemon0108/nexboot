@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"slices"
 	"strings"
 	"sync/atomic"
 
@@ -176,6 +177,25 @@ func livenessOnly(a, b domain.Server) bool {
 	return a == b
 }
 
+// poolRepository 让只刷新容量的更新不计数：池列表每次读都会把实时用量写回，用量又随每轮复制变化。
+type poolRepository struct {
+	repository[domain.Pool]
+	quiet repository[domain.Pool]
+}
+
+func (r poolRepository) Update(ctx context.Context, v domain.Pool) error {
+	if old, err := r.Get(ctx, v.ID); err == nil && usageOnly(old, v) {
+		return r.quiet.Update(ctx, v)
+	}
+	return r.repository.Update(ctx, v)
+}
+
+func usageOnly(a, b domain.Pool) bool {
+	return a.ServerID == b.ServerID && a.Name == b.Name && a.Layout == b.Layout && a.GroupWidth == b.GroupWidth &&
+		slices.Equal(a.Disks, b.Disks) && slices.Equal(a.ReadCacheDisks, b.ReadCacheDisks) &&
+		slices.Equal(a.WriteCacheDisks, b.WriteCacheDisks)
+}
+
 func New(db *sql.DB, dialect string) *SQLStore {
 	rev := &atomic.Uint64{}
 	return &SQLStore{db: db, q: counting{queryer: db, rev: rev}, dialect: dialect, rev: rev}
@@ -252,7 +272,12 @@ func (s *SQLStore) Servers() ServerRepo {
 		quiet:      newRepository(s.uncounted(), s.dialect, serverCodec),
 	}
 }
-func (s *SQLStore) Pools() PoolRepo         { return newRepository(s.q, s.dialect, poolCodec) }
+func (s *SQLStore) Pools() PoolRepo {
+	return poolRepository{
+		repository: newRepository(s.q, s.dialect, poolCodec),
+		quiet:      newRepository(s.uncounted(), s.dialect, poolCodec),
+	}
+}
 func (s *SQLStore) PoolDisks() PoolDiskRepo { return newRepository(s.q, s.dialect, poolDiskCodec) }
 func (s *SQLStore) ClientClones() ClientCloneRepo {
 	return newRepository(s.q, s.dialect, clientCloneCodec)
@@ -279,7 +304,10 @@ func (s *SQLStore) AuditLogs() AuditLogRepo {
 	return auditLogRepository{repository: newRepository(s.q, s.dialect, auditLogCodec)}
 }
 func (s *SQLStore) Alarms() AlarmRepo {
-	return alarmRepository{repository: newRepository(s.q, s.dialect, alarmCodec)}
+	return alarmRepository{
+		repository: newRepository(s.q, s.dialect, alarmCodec),
+		quiet:      newRepository(s.uncounted(), s.dialect, alarmCodec),
+	}
 }
 func (s *SQLStore) BackupStates() BackupStateRepo {
 	return backupStateRepository{repository: newRepository(s.q, s.dialect, backupStateCodec)}

@@ -334,6 +334,12 @@ func (m Manager) writeAndRestart(ctx context.Context, path, content string) erro
 		if rollbackErr != nil && m.Logger != nil {
 			m.Logger.Warn("could not roll back dnsmasq config after a failed restart", "path", path, "error", rollbackErr)
 		}
+		// restart 失败时 dnsmasq 已经停了，按旧配置再拉起来，否则 DHCP 要停到下次变更。
+		if rollbackErr == nil {
+			if out2, err2 := runner.Run(ctx, "systemctl", "restart", "dnsmasq"); err2 != nil && m.Logger != nil {
+				m.Logger.Warn("dnsmasq did not come back on the previous config", "error", err2, "output", string(out2))
+			}
+		}
 		return fmt.Errorf("dnsmasq restart failed: %w: %s", err, string(out))
 	}
 	return nil

@@ -357,6 +357,10 @@ func TestSyncRetriesTheRestartAfterAFailedOne(t *testing.T) {
 	if data, _ := os.ReadFile(path); string(data) != "# old\n" {
 		t.Fatalf("重启失败后应恢复旧文件，实际：%s", data)
 	}
+	// restart 失败时 dnsmasq 已经停了；按旧配置再拉起来，否则 DHCP 一直停到下次变更。
+	if len(runner.calls) != 4 || strings.Join(append([]string{runner.calls[3].name}, runner.calls[3].args...), " ") != "systemctl restart dnsmasq" {
+		t.Fatalf("恢复旧文件后应再重启一次：%#v", runner.calls)
+	}
 	before := len(runner.calls)
 	if err := manager.Sync(context.Background(), groups); err != nil {
 		t.Fatal(err)

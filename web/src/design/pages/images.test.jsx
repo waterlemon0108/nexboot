@@ -658,6 +658,7 @@ describe('服务器目录进出', () => {
     await userEvent.click(screen.getByRole('button', { name: /导出镜像/ }));
     await userEvent.click(screen.getByRole('button', { name: /导出到服务器目录/ }));
     await waitFor(() => expect(exportImage).toHaveBeenCalledWith('win11'));
+    expect(await screen.findByText(/已开始导出到 192\.168\.10\.3 的 \/var\/lib\/ndiskless\/imports\/Win 11\.zfs/)).toBeTruthy();
   });
 });
 

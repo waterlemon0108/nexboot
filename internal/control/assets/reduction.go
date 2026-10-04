@@ -119,14 +119,14 @@ func (s ReductionService) Create(ctx context.Context, configID string, req Creat
 	if err != nil {
 		return ReductionOperationResult{}, err
 	}
+	if err := refuseSuperConfigChange(ctx, s.Store, configID, "新建还原点"); err != nil {
+		return ReductionOperationResult{}, err
+	}
 	claim, err := claimConfigImage(ctx, s.Store, domain.TaskTypeCreateReduction, cfg.ImageID, cfg.ID)
 	if err != nil {
 		return ReductionOperationResult{}, err
 	}
 	defer claim.Drop()
-	if err := refuseSuperConfigChange(ctx, s.Store, configID, "新建还原点"); err != nil {
-		return ReductionOperationResult{}, err
-	}
 
 	reductions, err := s.Store.Reductions().ListByConfig(ctx, configID)
 	if err != nil {

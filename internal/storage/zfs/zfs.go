@@ -410,6 +410,12 @@ func (c *Client) Destroy(ctx context.Context, dataset string) error {
 	return c.run(ctx, "destroy", "-r", dataset)
 }
 
+// IsStreamBroken 判断接收失败是因为发送端的流中途断了（"failed to read from stream"），而非流本身收不进。
+func IsStreamBroken(err error) bool {
+	var cmdErr storage.CommandError
+	return errors.As(err, &cmdErr) && strings.Contains(cmdErr.Output, "failed to read from stream")
+}
+
 // IsBusy 判断 err 是否为 zfs 因数据集仍被占用而拒绝（"dataset is busy"），例如 LIO 拆除后
 // 内核延迟释放 zvol 独占。CLI 报错文本的解析归本包，调用方统一走这里。
 func IsBusy(err error) bool {

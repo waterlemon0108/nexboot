@@ -160,12 +160,15 @@ func (s GroupService) Update(ctx context.Context, id string, req GroupRequest) (
 	if err != nil {
 		return domain.Group{}, err
 	}
-	if err := refuseSuperGroupChange(ctx, s.Store, id, "修改分组"); err != nil {
-		return domain.Group{}, err
-	}
 	group, err := s.prepareGroup(ctx, current, req)
 	if err != nil {
 		return domain.Group{}, err
+	}
+	// 默认标志只决定新机器归哪组，和超管保存无关；表单里只切了它就不拦。
+	if !onlyDefaultChanged(current, group) {
+		if err := refuseSuperGroupChange(ctx, s.Store, id, "修改分组"); err != nil {
+			return domain.Group{}, err
+		}
 	}
 	groups, err := s.Store.Groups().List(ctx)
 	if err != nil {
@@ -427,11 +430,6 @@ func (s GroupService) Delete(ctx context.Context, id string) error {
 			}
 		}
 	}
-	if nextDefault != "" {
-		if err := refuseSuperGroupChange(ctx, s.Store, nextDefault, "切换默认分组"); err != nil {
-			return err
-		}
-	}
 
 	if err := s.Store.Tx(ctx, func(tx store.Store) error {
 		if err := tx.Groups().Delete(ctx, id); err != nil {
@@ -458,9 +456,6 @@ func (s GroupService) SetDefault(ctx context.Context, id string) (domain.Group, 
 
 	group, err := s.Store.Groups().Get(ctx, id)
 	if err != nil {
-		return domain.Group{}, err
-	}
-	if err := refuseSuperGroupChange(ctx, s.Store, id, "切换默认分组"); err != nil {
 		return domain.Group{}, err
 	}
 	group.IsDefault = true
@@ -866,13 +861,6 @@ func clearDefaultGroups(ctx context.Context, st store.Store, exceptID string) er
 	}
 	for _, group := range groups {
 		if group.IsDefault && group.ID != exceptID {
-			if err := refuseSuperGroupChange(ctx, st, group.ID, "切换默认分组"); err != nil {
-				return err
-			}
-		}
-	}
-	for _, group := range groups {
-		if group.IsDefault && group.ID != exceptID {
 			group.IsDefault = false
 			if err := st.Groups().Update(ctx, group); err != nil {
 				return err
@@ -880,6 +868,16 @@ func clearDefaultGroups(ctx context.Context, st store.Store, exceptID string) er
 		}
 	}
 	return nil
+}
+
+func onlyDefaultChanged(before, after domain.Group) bool {
+	if (before.StorageServerID == nil) != (after.StorageServerID == nil) ||
+		(before.StorageServerID != nil && *before.StorageServerID != *after.StorageServerID) {
+		return false
+	}
+	// 还原点由配置决定，prepareGroup 会按配置当前点重算，不算表单改动。
+	before.IsDefault, before.SystemReductionID, before.StorageServerID = after.IsDefault, after.SystemReductionID, after.StorageServerID
+	return before == after
 }
 
 func hasOtherDefault(groups []domain.Group, id string) bool {

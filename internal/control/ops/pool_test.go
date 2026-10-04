@@ -240,9 +240,9 @@ func TestPoolServiceAttachDisk(t *testing.T) {
 		msg    string
 	}{
 		{"needs a target", domain.PoolLayoutStripe, PoolDiskRequest{Mode: "attach", Disks: []string{"/dev/sdz"}}, errs.ErrInvalid, "请指定要加镜像的盘"},
-		{"exactly one disk", domain.PoolLayoutStripe, PoolDiskRequest{Mode: "attach", Target: "/dev/sda", Disks: []string{"/dev/sdz", "/dev/sdy"}}, errs.ErrInvalid, "一次只能给一块盘加一块镜像盘"},
+		{"exactly one disk", domain.PoolLayoutStripe, PoolDiskRequest{Mode: "attach", Target: "/dev/sda", Disks: []string{"/dev/sdz", "/dev/sdy"}}, errs.ErrInvalid, "一次只能给一块盘加一块 RAID1 盘"},
 		{"target must be a data disk", domain.PoolLayoutStripe, PoolDiskRequest{Mode: "attach", Target: "/dev/nvme0n1", Disks: []string{"/dev/sdz"}}, errs.ErrInvalid, "/dev/nvme0n1 不是 t 的存储盘"},
-		{"new disk must not be smaller", domain.PoolLayoutStripe, PoolDiskRequest{Mode: "attach", Target: "/dev/sda", Disks: []string{"/dev/sdy"}}, errs.ErrInvalid, "镜像盘不能比原盘小"},
+		{"new disk must not be smaller", domain.PoolLayoutStripe, PoolDiskRequest{Mode: "attach", Target: "/dev/sda", Disks: []string{"/dev/sdy"}}, errs.ErrInvalid, "RAID1 盘不能比原盘小"},
 		{"raidz cannot take another disk", domain.PoolLayoutRaidz1, PoolDiskRequest{Mode: "attach", Target: "/dev/sda", Disks: []string{"/dev/sdz"}}, errs.ErrConflict, "raidz 无法追加校验盘"},
 	}
 	for _, tc := range refused {
@@ -403,11 +403,11 @@ func TestPoolServiceMirrorUpgrade(t *testing.T) {
 		kind   error
 		msg    string
 	}{
-		{"needs pairs", domain.PoolLayoutStripe, MirrorUpgradeRequest{}, errs.ErrInvalid, "请为每块存储盘选一块镜像盘"},
+		{"needs pairs", domain.PoolLayoutStripe, MirrorUpgradeRequest{}, errs.ErrInvalid, "请为每块存储盘选一块 RAID1 盘"},
 		{"raidz has no stripe members", domain.PoolLayoutRaidz1, MirrorUpgradeRequest{Pairs: pairs}, errs.ErrConflict, "raidz"},
 		{"target must be a data disk", domain.PoolLayoutStripe, MirrorUpgradeRequest{Pairs: []MirrorPair{{Target: "/dev/sdx", Disk: "/dev/sdc"}}}, errs.ErrInvalid, "/dev/sdx 不是 t 的存储盘"},
 		{"a disk is used once", domain.PoolLayoutStripe, MirrorUpgradeRequest{Pairs: []MirrorPair{{Target: "/dev/sda", Disk: "/dev/sdc"}, {Target: "/dev/sdb", Disk: "/dev/sdc"}}}, errs.ErrInvalid, "/dev/sdc 被选了两次"},
-		{"a disk is not smaller than its target", domain.PoolLayoutStripe, MirrorUpgradeRequest{Pairs: []MirrorPair{{Target: "/dev/sda", Disk: "/dev/sde"}}}, errs.ErrInvalid, "镜像盘不能比原盘小"},
+		{"a disk is not smaller than its target", domain.PoolLayoutStripe, MirrorUpgradeRequest{Pairs: []MirrorPair{{Target: "/dev/sda", Disk: "/dev/sde"}}}, errs.ErrInvalid, "RAID1 盘不能比原盘小"},
 	}
 	for _, tc := range refused {
 		t.Run(tc.name, func(t *testing.T) {
@@ -585,7 +585,7 @@ func TestPoolServiceMatchesWholeDiskAndItsPartition(t *testing.T) {
 		}
 		// 容量检查也能通过分区名找到整盘。
 		svc2, _ := newSvc(t)
-		if _, err := svc2.AddDisk(ctx, "pool-t", PoolDiskRequest{Mode: "attach", Target: "/dev/sda1", Disks: []string{"/dev/sdd"}}); err == nil || !strings.Contains(err.Error(), "镜像盘不能比原盘小") {
+		if _, err := svc2.AddDisk(ctx, "pool-t", PoolDiskRequest{Mode: "attach", Target: "/dev/sda1", Disks: []string{"/dev/sdd"}}); err == nil || !strings.Contains(err.Error(), "RAID1 盘不能比原盘小") {
 			t.Fatalf("size check via partition name: err = %v", err)
 		}
 	})

@@ -259,9 +259,35 @@ describe('存储页', () => {
       { ...RAIDZ_POOL, Role: '' },
     ]) });
     renderPage();
-    expect(await screen.findByText('数据池')).toBeTruthy();
-    expect(screen.getByText('备份池')).toBeTruthy();
-    expect(screen.getByText('未指定')).toBeTruthy();
+    const table = await screen.findByRole('table');
+    expect(await within(table).findByText('数据池')).toBeTruthy();
+    expect(within(table).getByText('备份池')).toBeTruthy();
+    expect(within(table).getByText('未指定')).toBeTruthy();
+  });
+
+  it('数据池排在备份池前面，同类保持原来的节点顺序', async () => {
+    stubApi({ listPools: async () => list([
+      { ...POOLS[0], ID: 'b3', Name: 'backup3', Role: 'backup' },
+      { ...POOLS[0], ID: 'd3', Name: 'tank3', Role: 'data' },
+      { ...POOLS[0], ID: 'b4', Name: 'backup4', Role: 'backup' },
+      { ...POOLS[0], ID: 'd4', Name: 'tank4', Role: 'data' },
+    ]) });
+    renderPage();
+    await screen.findByText('tank3');
+    const names = screen.getAllByRole('row').slice(1).map(r => r.textContent.match(/(tank\d|backup\d)/)?.[0]).filter(Boolean);
+    expect(names).toEqual(['tank3', 'tank4', 'backup3', 'backup4']);
+  });
+
+  it('按池类型筛选', async () => {
+    stubApi({ listPools: async () => list([
+      { ...POOLS[0], ID: 'd3', Name: 'tank3', Role: 'data' },
+      { ...POOLS[0], ID: 'b3', Name: 'backup3', Role: 'backup' },
+    ]) });
+    renderPage();
+    await screen.findByText('tank3');
+    await userEvent.selectOptions(screen.getByLabelText('按类型筛选'), 'backup');
+    await waitFor(() => expect(screen.queryByText('tank3')).toBeNull());
+    expect(screen.getByText('backup3')).toBeTruthy();
   });
 
   // 每台最多两个池（数据 + 备份），到上限时按钮说明原因，不等后端拒绝。
@@ -303,7 +329,7 @@ describe('存储页', () => {
     renderPage();
     await screen.findByText('tank');
     // 过滤器是 <select>，不是一排按钮。
-    await userEvent.selectOptions(screen.getByDisplayValue('全部'), 'abnormal');
+    await userEvent.selectOptions(screen.getByLabelText('按状态筛选'), 'abnormal');
     await waitFor(() => expect(screen.queryByText('tank')).toBeNull());
     expect(screen.getByText('cold')).toBeTruthy();
   });
@@ -463,7 +489,7 @@ describe('存储页', () => {
     await waitFor(() => expect(addPoolDisk).toHaveBeenCalledWith('pool-cold', { disks: ['/dev/sdc', '/dev/sdg'] }));
 
     // 附加：成员行自己的操作给这块盘加镜像。
-    await userEvent.click(screen.getByRole('button', { name: '给 /dev/sdb 加镜像盘' }));
+    await userEvent.click(screen.getByRole('button', { name: '给 /dev/sdb 加 RAID1 盘' }));
     const confirm2 = await screen.findByRole('button', { name: '确认' });
     await userEvent.click(screen.getByText(/sdh/));
     await userEvent.click(confirm2);
@@ -476,7 +502,7 @@ describe('存储页', () => {
     renderPage();
     await userEvent.click(await screen.findByText('backup'));
     await screen.findByText('raidz2-0');
-    expect(screen.queryByRole('button', { name: /加镜像盘/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /加 RAID1 盘/ })).toBeNull();
 
     await userEvent.click(screen.getAllByRole('button', { name: /添加/ })[0]);
     const confirm = await screen.findByRole('button', { name: '确认' });
@@ -521,20 +547,32 @@ describe('存储页', () => {
     await waitFor(() => expect(removePoolDisk).toHaveBeenCalledWith('pool-cold', { disk: 'mirror-1' }));
   });
 
-  // 条带池通过向导升级为镜像：每块数据盘配一块空闲盘，一个任务全部附加，在线进行、不重建。
-  it('条带池可一键升级为镜像', async () => {
+  // 多块盘的条带池通过向导升级为 RAID1：每块数据盘配一块空闲盘，一个任务全部附加，在线进行、不重建。
+  // 「镜像」在本产品指系统镜像，磁盘镜像统一叫 RAID1。
+  it('多盘条带池可一键升级为 RAID1', async () => {
     const mirrorUpgradePool = vi.fn(async () => ({ task_id: 'task-mirror_upgrade-1' }));
-    stubApi({ mirrorUpgradePool });
+    stubApi({ mirrorUpgradePool, listPools: async () => list([{ ...POOLS[0], Disks: ['sda', 'sdb'] }]) });
     renderPage();
     await userEvent.click(await screen.findByText('tank'));
-    await userEvent.click(await screen.findByRole('button', { name: /升级为镜像/ }));
+    await userEvent.click(await screen.findByRole('button', { name: /升级为 RAID1/ }));
 
     const start = await screen.findByRole('button', { name: '开始升级' });
     expect(start.disabled).toBe(true); // 尚未配对
-    await userEvent.selectOptions(screen.getByLabelText('sda 的镜像盘'), '/dev/sdc');
+    await userEvent.selectOptions(screen.getByLabelText('sda 的 RAID1 盘'), '/dev/sdc');
+    expect(start.disabled).toBe(true); // 只配一半仍无冗余
+    await userEvent.selectOptions(screen.getByLabelText('sdb 的 RAID1 盘'), '/dev/sdg');
     expect(start.disabled).toBe(false);
     await userEvent.click(start);
-    await waitFor(() => expect(mirrorUpgradePool).toHaveBeenCalledWith('pool-tank', { pairs: [{ target: 'sda', disk: '/dev/sdc' }] }));
+    await waitFor(() => expect(mirrorUpgradePool).toHaveBeenCalledWith('pool-tank',
+      { pairs: [{ target: 'sda', disk: '/dev/sdc' }, { target: 'sdb', disk: '/dev/sdg' }] }));
+  });
+
+  // 只有一块数据盘时「升级」和这块盘的「加 RAID1 盘」是同一件事，只留后者。
+  it('单盘条带池不显示升级，只给这块盘加 RAID1 盘', async () => {
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    expect(await screen.findByRole('button', { name: '给 sda 加 RAID1 盘' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /升级为 RAID1/ })).toBeNull();
   });
 
   // special vdev 存元数据，只能镜像添加；热备盘按单盘增删。
@@ -592,7 +630,7 @@ describe('存储页', () => {
   // 表格显示布局，详情按组展示成员，降级的组点名掉线的成员。
   it('列表显示布局，详情按组展示成员', async () => {
     renderPage();
-    expect(await screen.findByText('镜像 ×2')).toBeTruthy();
+    expect(await screen.findByText('镜像（RAID1）×2')).toBeTruthy();
     expect(screen.getByText('条带')).toBeTruthy();
 
     await userEvent.click(screen.getByText('cold'));

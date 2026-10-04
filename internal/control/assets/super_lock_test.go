@@ -54,7 +54,7 @@ func newSuperLockFixture(t *testing.T) superLockFixture {
 
 func requireSuperLocked(t *testing.T, err error, who string) {
 	t.Helper()
-	if !errors.Is(err, errs.ErrConflict) || !strings.Contains(err.Error(), "请先关闭超管机「"+who+"」的超管模式，再") || !strings.Contains(err.Error(), "（有未保存的修改，先停机存还原点）") {
+	if !errors.Is(err, errs.ErrConflict) || !strings.Contains(err.Error(), "请先取消超管机「"+who+"」的超管，再") || !strings.Contains(err.Error(), "（要保留改动，先关机后点「关机后存还原点」）") {
 		t.Fatalf("应拒绝并点名超管机，err = %v", err)
 	}
 }
@@ -67,10 +67,6 @@ func TestSuperModeLocksItsGroupAndConfigs(t *testing.T) {
 	}{
 		{"超管机换分组", func(f superLockFixture) error {
 			_, err := f.terminals.Update(f.ctx, f.super.ID, TerminalRequest{MAC: f.super.MAC, IP: "192.168.1.100", GroupID: "grp-2", Name: f.super.Name, IsSuper: true})
-			return err
-		}},
-		{"同组批量移动带上超管机", func(f superLockFixture) error {
-			_, err := f.terminals.Move(f.ctx, MoveTerminalsRequest{TerminalIDs: []string{f.plain.ID, f.super.ID}, GroupID: f.group.ID})
 			return err
 		}},
 		{"批量移动带上超管机", func(f superLockFixture) error {
@@ -87,16 +83,6 @@ func TestSuperModeLocksItsGroupAndConfigs(t *testing.T) {
 		}},
 		{"删除分组", func(f superLockFixture) error { return f.groups.Delete(f.ctx, f.group.ID) }},
 		{"删除数据盘", func(f superLockFixture) error { return f.disks.Delete(f.ctx, f.disk.ID) }},
-		{"设置占用组为默认", func(f superLockFixture) error { _, err := f.groups.SetDefault(f.ctx, f.group.ID); return err }},
-		{"间接切换占用组默认标志", func(f superLockFixture) error { _, err := f.groups.SetDefault(f.ctx, "grp-2"); return err }},
-		{"新建默认组", func(f superLockFixture) error {
-			_, err := f.groups.Create(f.ctx, GroupRequest{Name: "三区", IsDefault: true, StartIP: "192.168.1.200", ClientMax: 10, Gateway: f.group.Gateway, Netmask: f.group.Netmask, SystemImageID: "img-1", SystemConfigID: "cfg-1"})
-			return err
-		}},
-		{"修改其他组为默认", func(f superLockFixture) error {
-			_, err := f.groups.Update(f.ctx, "grp-2", GroupRequest{Name: "二区", IsDefault: true, StartIP: "192.168.1.100", ClientMax: 10, Gateway: f.group.Gateway, Netmask: f.group.Netmask, SystemImageID: "img-1", SystemConfigID: "cfg-1"})
-			return err
-		}},
 		{"加数据盘", func(f superLockFixture) error {
 			_, err := f.disks.Create(f.ctx, f.group.ID, GroupDiskRequest{MountTarget: "E:", ImageID: "img-data", ConfigID: "cfg-data"})
 			return err
@@ -241,7 +227,8 @@ func TestSuperModeLocksSiblingConfigsAffectedByMerge(t *testing.T) {
 	}
 }
 
-func TestSuperModeLocksDefaultTransferOnGroupDelete(t *testing.T) {
+// 默认标志只决定新机器归哪组，删除默认组时转给超管机所在组不受超管锁定影响。
+func TestSuperModeAllowsDefaultTransferOnGroupDelete(t *testing.T) {
 	f := newSuperLockFixture(t)
 	f.super.GroupID, f.super.IP = "grp-2", "192.168.1.100"
 	if err := f.st.Terminals().Update(f.ctx, f.super); err != nil {
@@ -250,10 +237,15 @@ func TestSuperModeLocksDefaultTransferOnGroupDelete(t *testing.T) {
 	if err := f.st.Terminals().Delete(f.ctx, f.plain.ID); err != nil {
 		t.Fatal(err)
 	}
-	before := superLockState(t, f)
-	requireSuperLocked(t, f.groups.Delete(f.ctx, f.group.ID), f.super.Name)
-	if !reflect.DeepEqual(before, superLockState(t, f)) {
-		t.Fatal("默认组转移被拒绝后原组应保留")
+	if err := f.groups.Delete(f.ctx, f.group.ID); err != nil {
+		t.Fatalf("删除默认组应可用：%v", err)
+	}
+	next, err := f.st.Groups().Get(f.ctx, "grp-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !next.IsDefault {
+		t.Fatal("默认应转给剩下的分组")
 	}
 }
 
@@ -296,6 +288,32 @@ func TestSuperModeAllowsIndependentChangesAndClosing(t *testing.T) {
 		}},
 		{"从配置另存", func(f superLockFixture) error {
 			_, err := f.configs.CreateFromConfig(f.ctx, "cfg-1", CreateConfigFromConfigRequest{Name: "另存", ReductionID: "red-1"})
+			return err
+		}},
+		{"把占用组设为默认", func(f superLockFixture) error { _, err := f.groups.SetDefault(f.ctx, f.group.ID); return err }},
+		{"把别的组设为默认", func(f superLockFixture) error { _, err := f.groups.SetDefault(f.ctx, "grp-2"); return err }},
+		{"新建默认组", func(f superLockFixture) error {
+			_, err := f.groups.Create(f.ctx, GroupRequest{Name: "三区", IsDefault: true, StartIP: "192.168.1.200", ClientMax: 10, Gateway: f.group.Gateway, Netmask: f.group.Netmask, SystemImageID: "img-1", SystemConfigID: "cfg-1"})
+			return err
+		}},
+		{"改别的组为默认", func(f superLockFixture) error {
+			_, err := f.groups.Update(f.ctx, "grp-2", GroupRequest{Name: "二区", IsDefault: true, StartIP: "192.168.1.100", ClientMax: 10, Gateway: f.group.Gateway, Netmask: f.group.Netmask, SystemImageID: "img-1", SystemConfigID: "cfg-1"})
+			return err
+		}},
+		{"批量移动到超管机本来所在的组", func(f superLockFixture) error {
+			_, err := f.terminals.Move(f.ctx, MoveTerminalsRequest{TerminalIDs: []string{f.plain.ID, f.super.ID}, GroupID: f.group.ID})
+			return err
+		}},
+		{"编辑表单只切换默认", func(f superLockFixture) error {
+			if _, err := f.groups.SetDefault(f.ctx, "grp-2"); err != nil {
+				return err
+			}
+			g, err := f.st.Groups().Get(f.ctx, f.group.ID)
+			if err != nil {
+				return err
+			}
+			_, err = f.groups.Update(f.ctx, g.ID, GroupRequest{Name: g.Name, IsDefault: true, StartIP: g.StartIP, ClientMax: g.ClientMax,
+				Gateway: g.Gateway, Netmask: g.Netmask, DNS1: g.DNS1, DNS2: g.DNS2, SystemImageID: g.SystemImageID, SystemConfigID: g.SystemConfigID})
 			return err
 		}},
 		{"关闭超管", func(f superLockFixture) error { _, err := f.terminals.DisableSuper(f.ctx, f.super.ID); return err }},
@@ -538,5 +556,46 @@ func TestSuperModeCannotBeImportedDuringConfigMutation(t *testing.T) {
 	}
 	if !reflect.DeepEqual(before, superLockState(t, f)) {
 		t.Fatal("不能部分提交普通导入行")
+	}
+}
+
+type hookedSuperStopStorage struct {
+	*fakeSuperStopStorage
+	during func()
+}
+
+func (s hookedSuperStopStorage) SuperStop(ctx context.Context, req storage.SuperStopReq) (storage.SuperStopResult, error) {
+	s.during()
+	return s.fakeSuperStopStorage.SuperStop(ctx, req)
+}
+
+// 保存要等机器关机，可能要一两分钟；期间对终端的改动（如改名）不能被保存结束时写回的旧记录盖掉。
+func TestSuperSaveKeepsChangesMadeWhileWaiting(t *testing.T) {
+	f := newSuperLockFixture(t)
+	bundle, at := "bundle-1", time.Now().UTC()
+	f.super.PendingBundleID, f.super.PendingBundleAt = &bundle, &at
+	if err := f.st.Terminals().Update(f.ctx, f.super); err != nil {
+		t.Fatal(err)
+	}
+	f.terminals.Storage = hookedSuperStopStorage{
+		fakeSuperStopStorage: &fakeSuperStopStorage{reduction: domain.Reduction{ID: "saved", ConfigID: "cfg-1", Name: "@saved", CreatedAt: at, Status: domain.ReductionStatusReady}},
+		during: func() {
+			cur, _ := f.st.Terminals().Get(f.ctx, f.super.ID)
+			cur.Name = "主播-01-改名"
+			_ = f.st.Terminals().Update(f.ctx, cur)
+		},
+	}
+	if _, err := f.terminals.StopSuper(f.ctx, f.super.ID, SuperStopRequest{ReductionName: "saved"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.st.Terminals().Get(f.ctx, f.super.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "主播-01-改名" {
+		t.Fatalf("保存把等待期间的改动盖掉了：%+v", got)
+	}
+	if got.PendingBundleID != nil {
+		t.Fatalf("驱动包应随保存固化：%+v", got)
 	}
 }

@@ -83,9 +83,19 @@ func SuperEditingConfig(ctx context.Context, st store.Store, configID string) (d
 	if configID == "" {
 		return domain.Terminal{}, false, nil
 	}
-	terminals, err := st.Terminals().List(ctx)
+	held, err := superHeldConfigs(ctx, st)
 	if err != nil {
 		return domain.Terminal{}, false, err
+	}
+	terminal, ok := held[configID]
+	return terminal, ok, nil
+}
+
+// superHeldConfigs 一次读表算出各超管机占用的配置（所在分组的系统盘和各数据盘）及占用者。
+func superHeldConfigs(ctx context.Context, st store.Store) (map[string]domain.Terminal, error) {
+	terminals, err := st.Terminals().List(ctx)
+	if err != nil {
+		return nil, err
 	}
 	var supers []domain.Terminal
 	for _, terminal := range terminals {
@@ -94,11 +104,11 @@ func SuperEditingConfig(ctx context.Context, st store.Store, configID string) (d
 		}
 	}
 	if len(supers) == 0 {
-		return domain.Terminal{}, false, nil
+		return nil, nil
 	}
 	groups, err := st.Groups().List(ctx)
 	if err != nil {
-		return domain.Terminal{}, false, err
+		return nil, err
 	}
 	groupsByID := make(map[string]domain.Group, len(groups))
 	for _, group := range groups {
@@ -106,18 +116,21 @@ func SuperEditingConfig(ctx context.Context, st store.Store, configID string) (d
 	}
 	disks, err := st.GroupDisks().List(ctx)
 	if err != nil {
-		return domain.Terminal{}, false, err
+		return nil, err
 	}
+	held := map[string]domain.Terminal{}
 	for _, terminal := range supers {
 		group, ok := groupsByID[terminal.GroupID]
 		if !ok {
 			continue
 		}
-		if groupConfigIDs(group, disks)[configID] {
-			return terminal, true, nil
+		for configID := range groupConfigIDs(group, disks) {
+			if _, taken := held[configID]; !taken {
+				held[configID] = terminal
+			}
 		}
 	}
-	return domain.Terminal{}, false, nil
+	return held, nil
 }
 
 func superModeRefusal(terminal domain.Terminal, action string) error {
@@ -125,7 +138,7 @@ func superModeRefusal(terminal domain.Terminal, action string) error {
 	if who == "" {
 		who = formatMAC(terminal.MAC)
 	}
-	return errs.Conflict(fmt.Sprintf("请先关闭超管机「%s」的超管模式，再%s（有未保存的修改，先停机存还原点）", who, action))
+	return errs.Conflict(fmt.Sprintf("请先取消超管机「%s」的超管，再%s（要保留改动，先关机后点「关机后存还原点」）", who, action))
 }
 
 func refuseSuperGroupChange(ctx context.Context, st store.Store, groupID, action string) error {
@@ -154,13 +167,17 @@ func refuseSuperConfigChange(ctx context.Context, st store.Store, configID, acti
 
 // 合并、覆盖和删除镜像会影响其全部配置；另存配置只读来源，不走此检查。
 func refuseSuperImageChange(ctx context.Context, st store.Store, imageID, action string) error {
+	held, err := superHeldConfigs(ctx, st)
+	if err != nil || len(held) == 0 {
+		return err
+	}
 	configs, err := st.Configs().ListByImage(ctx, imageID)
 	if err != nil {
 		return err
 	}
 	for _, cfg := range configs {
-		if err := refuseSuperConfigChange(ctx, st, cfg.ID, action); err != nil {
-			return err
+		if terminal, ok := held[cfg.ID]; ok {
+			return superModeRefusal(terminal, action)
 		}
 	}
 	return nil

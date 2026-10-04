@@ -23,6 +23,20 @@ type AlarmSummary struct {
 
 type alarmRepository struct {
 	repository[domain.Alarm]
+	quiet repository[domain.Alarm]
+}
+
+// Update 让每轮评估只刷新数值和文案的更新不计数，否则只要有一条未关闭的告警，空闲集群就每轮复制。
+func (r alarmRepository) Update(ctx context.Context, v domain.Alarm) error {
+	if old, err := r.Get(ctx, v.ID); err == nil && valueOnly(old, v) {
+		return r.quiet.Update(ctx, v)
+	}
+	return r.repository.Update(ctx, v)
+}
+
+func valueOnly(a, b domain.Alarm) bool {
+	return a.AlarmKey == b.AlarmKey && a.Severity == b.Severity && a.Type == b.Type && a.Source == b.Source &&
+		a.Resource == b.Resource && a.Threshold == b.Threshold && a.Status == b.Status
 }
 
 func alarmWhere(r alarmRepository, f AlarmFilter) (string, []any) {

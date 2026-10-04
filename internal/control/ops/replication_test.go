@@ -45,6 +45,10 @@ type fakeReplZFS struct {
 	pruneErr error
 	// siblings 是 <root> 旁边已经存在的挪开副本（上几轮失败留下的）。
 	siblings []string
+	// renameErr 模拟 rename 失败，如残留挂载让 tank/nd 卸不下来。
+	renameErr error
+	// datasetRecvErr 让追平轮的单个数据集接收失败。
+	datasetRecvErr error
 	// onRecvErr 在收流失败时改写本机状态：递归增量失败时，流里靠前的根和镜像已收下这一轮，
 	// 被顶替的配置则被 -F 回滚。
 	onRecvErr func()
@@ -119,6 +123,9 @@ func (f *fakeReplZFS) DetachMounts(_ context.Context, dataset string) error {
 	return nil
 }
 func (f *fakeReplZFS) Rename(_ context.Context, source, dataset string) error {
+	if f.renameErr != nil {
+		return f.renameErr
+	}
 	f.renamed = append(f.renamed, source+"->"+dataset)
 	if inv, ok := f.guids[source]; ok {
 		f.guids[dataset] = inv
@@ -130,7 +137,7 @@ func (f *fakeReplZFS) Rename(_ context.Context, source, dataset string) error {
 func (f *fakeReplZFS) ReceiveDataset(_ context.Context, dataset string, r io.Reader) error {
 	b, _ := io.ReadAll(r)
 	f.received = append(f.received, dataset+" <- "+string(b))
-	return nil
+	return f.datasetRecvErr
 }
 
 func (f *fakeReplZFS) Destroy(_ context.Context, dataset string) error {
@@ -351,6 +358,34 @@ func TestPullOnceNoopWhenInStep(t *testing.T) {
 	rows, _ := st.ReplicationStates().List(ctx)
 	if len(rows) != 1 || rows[0].LastSnapshot != "rep-2" {
 		t.Fatalf("state = %#v", rows)
+	}
+}
+
+// 同步到最新一轮后，重建残留都已没用，全部回收；被打断的重建靠续传和追平补齐时不经过 rebuildWhole，只能在这里收。
+func TestPullOncePrunesAsideCopiesAfterSync(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	gate := ha.NewOpenGate()
+	gate.Close("备机", "http://a:8080")
+	z := &fakeReplZFS{
+		guids: map[string]zfs.GUIDInventory{
+			"tank/nd": {Entries: []zfs.GUIDEntry{{Name: "tank/nd@rep-2", GUID: "g2"}}},
+		},
+		siblings: []string{"tank/nd-rebuilding-100", "tank/nd-diverged-150", "tank/nd-rebuilding-200"},
+	}
+	peer := &fakeReplPeer{inv: ha.ReplicationInventory{Root: "tank/nd", Entries: []zfs.GUIDEntry{
+		{Name: "tank/nd@rep-2", GUID: "g2"},
+	}}}
+	rep := &Replicator{Store: st, ZFS: z, Root: "tank/nd", Gate: gate, Now: replTestClock(), Peer: peer, PeerURL: "http://a:8080"}
+
+	if err := rep.PullOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(z.destroyed, "tank/nd-rebuilding-100") || !contains(z.destroyed, "tank/nd-rebuilding-200") {
+		t.Fatalf("同步成功后重建残留应全部回收：destroyed=%v", z.destroyed)
+	}
+	if contains(z.destroyed, "tank/nd-diverged-150") {
+		t.Fatalf("保住的分叉副本不该删：destroyed=%v", z.destroyed)
 	}
 }
 
@@ -1276,49 +1311,91 @@ func TestRebuildDoesNotPreserveAnEmptyCatalogue(t *testing.T) {
 	}
 }
 
-// 挪开的副本必须有上限：每轮失败都留一份，名字带纳秒戳永不重名，不回收会把池吃光。
-func TestRebuildKeepsOnlyTheNewestAsideCopies(t *testing.T) {
-	ctx := context.Background()
-	z := &fakeReplZFS{
-		dbCopyDir: t.TempDir(),
-		guids: map[string]zfs.GUIDInventory{
-			"tank/nd": {Entries: []zfs.GUIDEntry{
-				{Name: "tank/nd", GUID: "1"},
-				{Name: "tank/nd/win11", GUID: "2"}, // 非空：这一份值得保全
-			}},
-		},
-		siblings: []string{
-			"tank/nd-rebuilding-100", "tank/nd-rebuilding-200",
-			"tank/nd-diverged-300", "tank/nd-rebuilding-400",
-		},
+// 重建被重启打断时回收来不及执行，只能靠之后的轮次清掉；之后那轮失败也得回收，只留最新一份供人工恢复。
+func TestFailedRebuildStillPrunesEarlierAsideCopies(t *testing.T) {
+	cases := []struct {
+		name string
+		set  func(*fakeReplZFS)
+	}{
+		{"改名挪开就失败", func(z *fakeReplZFS) {
+			z.renameErr = errors.New("cannot unmount '/ndiskless/tank/nd': pool or dataset is busy")
+		}},
+		{"接收失败后改回原名", func(z *fakeReplZFS) { z.recvErrs = []error{errors.New("out of space")} }},
 	}
-	rep := &Replicator{ZFS: z, Root: "tank/nd", Gate: ha.NewOpenGate(), Now: replTestClock(),
-		Peer: &fakeReplPeer{}, PeerURL: "http://a:8080"}
-	if err := rep.rebuildWhole(ctx, "rep-9"); err != nil {
-		t.Fatalf("rebuild: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newImageTestStore(t)
+			gate := ha.NewOpenGate()
+			gate.Close("备机", "http://a:8080")
+			// 本机没有共同快照、也没有自己写的东西：这一轮整体重建
+			z := &fakeReplZFS{dbCopyDir: t.TempDir(), guids: map[string]zfs.GUIDInventory{"tank/nd": {Entries: []zfs.GUIDEntry{
+				{Name: "tank/nd/win11", GUID: "d1"},
+			}}}}
+			z.siblings = []string{"tank/nd-rebuilding-100", "tank/nd-rebuilding-200", "tank/nd-diverged-250", "tank/nd-rebuilding-300"}
+			tc.set(z)
+			peer := &fakeReplPeer{inv: ha.ReplicationInventory{Root: "tank/nd", Entries: []zfs.GUIDEntry{
+				{Name: "tank/nd@rep-5", GUID: "peer-1"},
+				{Name: "tank/nd/win11", GUID: "d2"},
+			}}}
+			rep := &Replicator{Store: st, ZFS: z, Root: "tank/nd", Gate: gate, Now: replTestClock(), Peer: peer, PeerURL: "http://a:8080"}
+			if err := rep.PullOnce(context.Background()); err == nil {
+				t.Fatal("这一轮应当失败")
+			}
+			for _, old := range []string{"tank/nd-rebuilding-100", "tank/nd-rebuilding-200"} {
+				if !contains(z.destroyed, old) {
+					t.Fatalf("较早的重建残留 %s 没有回收：destroyed=%v", old, z.destroyed)
+				}
+			}
+			if contains(z.destroyed, "tank/nd-rebuilding-300") || contains(z.destroyed, "tank/nd-diverged-250") {
+				t.Fatalf("失败时最新一份和保住的副本不该删：destroyed=%v", z.destroyed)
+			}
+		})
 	}
-	// 本轮挪开的那份是最新的，必须留着；更早的重建残留只留到上限为止。
-	// -diverged- 不在回收范围内：它装着别处没有的内容，只能由人删。
-	left := []string{}
-	for _, s := range z.siblings {
-		if !contains(z.destroyed, s) {
-			left = append(left, s)
-		}
-	}
-	if !contains(left, "tank/nd-diverged-300") {
-		t.Fatalf("保住的那份被回收了：destroyed=%v", z.destroyed)
-	}
-	rebuilding := []string{}
-	for _, s := range left {
-		if strings.Contains(s, "-rebuilding-") {
-			rebuilding = append(rebuilding, s)
-		}
-	}
-	if len(rebuilding) > asideCopiesKept {
-		t.Fatalf("旧的重建残留没有被回收，还剩 %v（上限 %d）", rebuilding, asideCopiesKept)
-	}
-	if contains(z.destroyed, "tank/nd-rebuilding-400") {
-		t.Fatalf("最新的那份不该被删：%v", z.destroyed)
+}
+
+// 被打断的 -R 接收会把冲突数据集留在 recv-<pid>-<seq> 临时名下，挂在别的挂载点上让增量和重建改名一直报 busy。
+// 先删掉它再照常复制，不必整体重建；写入者那边真有同名数据集的不能动。
+func TestPullDropsStaleRecvTemp(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		peerHasIt bool
+	}{{"残留", false}, {"写入者也有同名数据集", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newImageTestStore(t)
+			gate := ha.NewOpenGate()
+			gate.Close("备机", "http://a:8080")
+			local := []zfs.GUIDEntry{
+				{Name: "tank/nd", GUID: "r1"}, {Name: "tank/nd@rep-5", GUID: "m5"},
+				{Name: "tank/nd/win11", GUID: "d1"}, {Name: "tank/nd/win11@rep-5", GUID: "w5"},
+				{Name: "tank/nd/recv-1465346-1", GUID: "t1"},
+			}
+			peerEntries := []zfs.GUIDEntry{
+				{Name: "tank/nd", GUID: "r1"}, {Name: "tank/nd@rep-5", GUID: "m5"},
+				{Name: "tank/nd/win11", GUID: "d1"}, {Name: "tank/nd/win11@rep-5", GUID: "w5"},
+			}
+			if tc.peerHasIt {
+				peerEntries = append(peerEntries, zfs.GUIDEntry{Name: "tank/nd/recv-1465346-1", GUID: "t1"})
+			}
+			z := &fakeReplZFS{dbCopyDir: t.TempDir(), guids: map[string]zfs.GUIDInventory{"tank/nd": {Entries: local}}}
+			peer := &fakeReplPeer{inv: ha.ReplicationInventory{Root: "tank/nd", Entries: peerEntries}}
+			rep := &Replicator{Store: st, ZFS: z, Root: "tank/nd", Gate: gate, Now: replTestClock(), Peer: peer, PeerURL: "http://a:8080"}
+			if err := rep.PullOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			dropped := contains(z.destroyed, "tank/nd/recv-1465346-1")
+			if tc.peerHasIt {
+				if dropped || len(z.renamed) > 0 {
+					t.Fatalf("写入者有的数据集不能当残留删：destroyed=%v renamed=%v", z.destroyed, z.renamed)
+				}
+				return
+			}
+			if !dropped || !contains(z.detached, "tank/nd/recv-1465346-1") {
+				t.Fatalf("残留要先卸载再删除：detached=%v destroyed=%v", z.detached, z.destroyed)
+			}
+			if len(z.renamed) > 0 {
+				t.Fatalf("删掉残留后照常复制即可，不该整体重建：renamed=%v", z.renamed)
+			}
+		})
 	}
 }
 
@@ -1643,6 +1720,38 @@ func TestPullCatchesUpDatasetByDatasetWhenTheRecursiveRoundIsRefused(t *testing.
 	}
 	if fmt.Sprint(z.received[1:]) != "[tank/nd/img <- DATASET:/img tank/nd/cfg <- DATASET:/cfg tank/nd <- DATASET:]" {
 		t.Fatalf("received = %v", z.received)
+	}
+}
+
+// 追平要跑很久时，写入者可能中途清掉目标那一轮的标记，流读到一半就断。下一轮换个目标重试即可；
+// 升级成整体重建会把已经追平的几十 G 全部丢掉从头收。
+func TestCatchUpInterruptedByTheStreamRetriesInsteadOfRebuilding(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	gate := ha.NewOpenGate()
+	gate.Close("备机", "http://a:8080")
+	sender := inv("data/nd",
+		[]string{"", "rep-1=r1", "rep-2=r2"},
+		[]string{"/img", "0=i0", "rep-1=i1", "rep-2=i2"},
+	)
+	z := &fakeReplZFS{
+		guids: map[string]zfs.GUIDInventory{"tank/nd": inv("tank/nd",
+			[]string{"", "rep-1=r1"},
+			[]string{"/img", "0=i0", "rep-1=i1"},
+		)},
+		recvErrs:       []error{errors.New("cannot receive incremental stream: most recent snapshot of tank/nd/img does not match incremental source")},
+		datasetRecvErr: storage.CommandError{Name: "zfs", Args: []string{"recv"}, Output: "cannot receive: failed to read from stream\n", Err: errFakeRepl},
+	}
+	peer := &fakeReplPeer{inv: ha.ReplicationInventory{Root: "data/nd", Entries: sender.Entries}}
+	rep := &Replicator{Store: st, ZFS: z, Peer: peer, Gate: gate, Root: "tank/nd", PeerURL: "http://a:8080", Now: replTestClock()}
+
+	if err := rep.PullOnce(ctx); err == nil {
+		t.Fatal("这一轮没追完，应报错等下一轮")
+	}
+	for _, r := range z.renamed {
+		if strings.HasPrefix(r, "tank/nd->") {
+			t.Fatalf("流中断不该升级成整体重建: %v", z.renamed)
+		}
 	}
 }
 

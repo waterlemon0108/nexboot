@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -512,7 +513,7 @@ func (s PoolService) MirrorUpgrade(ctx context.Context, id string, req MirrorUpg
 			t.Message = fmt.Sprintf("第 %d/%d 对：%s → %s", i+1, len(pairs), p.Target, p.Disk)
 			_ = s.Store.Tasks().Update(ctx, t)
 			if err := s.Storage.AttachDisk(ctx, pool.Name, p.Target, p.Disk); err != nil {
-				return fmt.Errorf("第 %d 对（%s → %s）失败：%s；已完成 %d 对，已加的镜像盘保留，处理后可对剩余的盘再次升级", i+1, p.Target, p.Disk, zfs.OperatorMessage(err), i)
+				return fmt.Errorf("第 %d 对（%s → %s）失败：%s；已完成 %d 对，已加的 RAID1 盘保留，处理后可对剩余的盘再次升级", i+1, p.Target, p.Disk, zfs.OperatorMessage(err), i)
 			}
 		}
 		var err error
@@ -541,7 +542,7 @@ func (s PoolService) checkMirrorPairs(ctx context.Context, pool domain.Pool, in 
 		pairs = append(pairs, p)
 	}
 	if len(pairs) == 0 {
-		return nil, errs.Invalid("请为每块存储盘选一块镜像盘")
+		return nil, errs.Invalid("请为每块存储盘选一块 RAID1 盘")
 	}
 	isData := func(path string) bool {
 		for _, d := range pool.Disks {
@@ -557,10 +558,10 @@ func (s PoolService) checkMirrorPairs(ctx context.Context, pool domain.Pool, in 
 			return nil, errs.Invalid(fmt.Sprintf("%s 不是 %s 的存储盘", p.Target, pool.Name))
 		}
 		if isData(p.Disk) {
-			return nil, errs.Invalid(fmt.Sprintf("%s 已经在 %s 里，不能再作镜像盘", p.Disk, pool.Name))
+			return nil, errs.Invalid(fmt.Sprintf("%s 已经在 %s 里，不能再作 RAID1 盘", p.Disk, pool.Name))
 		}
 		if seenTarget[p.Target] {
-			return nil, errs.Invalid(fmt.Sprintf("%s 被选了两次，一块盘只加一块镜像盘", p.Target))
+			return nil, errs.Invalid(fmt.Sprintf("%s 被选了两次，一块盘只加一块 RAID1 盘", p.Target))
 		}
 		if seenDisk[p.Disk] {
 			return nil, errs.Invalid(fmt.Sprintf("%s 被选了两次，一块空闲盘只能给一块盘做镜像", p.Disk))
@@ -571,7 +572,7 @@ func (s PoolService) checkMirrorPairs(ctx context.Context, pool domain.Pool, in 
 		for _, p := range pairs {
 			ts, ds := diskSizeOf(all, p.Target), diskSizeOf(all, p.Disk)
 			if ts > 0 && ds > 0 && ds < ts {
-				return nil, errs.Invalid(fmt.Sprintf("%s（%s）比 %s（%s）小，镜像盘不能比原盘小", p.Disk, fmtBytes(ds), p.Target, fmtBytes(ts)))
+				return nil, errs.Invalid(fmt.Sprintf("%s（%s）比 %s（%s）小，RAID1 盘不能比原盘小", p.Disk, fmtBytes(ds), p.Target, fmtBytes(ts)))
 			}
 		}
 	}
@@ -734,7 +735,7 @@ func (s PoolService) checkAttach(ctx context.Context, pool domain.Pool, target s
 		return errs.Invalid("请指定要加镜像的盘（target）")
 	}
 	if len(disks) != 1 {
-		return errs.Invalid(fmt.Sprintf("一次只能给一块盘加一块镜像盘，已选 %d 块", len(disks)))
+		return errs.Invalid(fmt.Sprintf("一次只能给一块盘加一块 RAID1 盘，已选 %d 块", len(disks)))
 	}
 	if pool.Layout.RaidzParity() > 0 {
 		return errs.Conflict(fmt.Sprintf("%s 是 %s 布局，raidz 无法追加校验盘；坏盘请用换盘", pool.Name, pool.Layout))
@@ -750,13 +751,13 @@ func (s PoolService) checkAttach(ctx context.Context, pool domain.Pool, target s
 		return errs.Invalid(fmt.Sprintf("%s 不是 %s 的存储盘，只有存储盘可以加镜像", target, pool.Name))
 	}
 	if storage.SameDisk(disks[0], target) {
-		return errs.Invalid("镜像盘不能是原盘自己")
+		return errs.Invalid("RAID1 盘不能是原盘自己")
 	}
 	// 容量来自 lsblk 仅作提前提示；未知时不拒绝，zpool 会真正校验。
 	if all, err := s.Storage.ListDisks(ctx); err == nil {
 		targetSize, newSize := diskSizeOf(all, target), diskSizeOf(all, disks[0])
 		if targetSize > 0 && newSize > 0 && newSize < targetSize {
-			return errs.Invalid(fmt.Sprintf("%s（%s）比 %s（%s）小，镜像盘不能比原盘小", disks[0], fmtBytes(newSize), target, fmtBytes(targetSize)))
+			return errs.Invalid(fmt.Sprintf("%s（%s）比 %s（%s）小，RAID1 盘不能比原盘小", disks[0], fmtBytes(newSize), target, fmtBytes(targetSize)))
 		}
 	}
 	return nil
@@ -1066,9 +1067,8 @@ func (s PoolService) poolItem(ctx context.Context, pool domain.Pool) (PoolItem, 
 	if err != nil {
 		return PoolItem{}, err
 	}
-	if status.Capacity != pool.Capacity || status.Used != pool.Used || len(status.Disks) > 0 ||
-		(status.Layout != "" && (status.Layout != pool.Layout || status.GroupWidth != pool.GroupWidth)) {
-		pool = applyPoolStatus(pool, status)
+	if updated := applyPoolStatus(pool, status); !samePoolRecord(pool, updated) {
+		pool = updated
 		if err := s.Store.Pools().Update(ctx, pool); err != nil {
 			return PoolItem{}, err
 		}
@@ -1185,6 +1185,12 @@ func applyPoolStatus(pool domain.Pool, status domain.PoolStatus) domain.Pool {
 		pool.GroupWidth = status.GroupWidth
 	}
 	return pool
+}
+
+func samePoolRecord(a, b domain.Pool) bool {
+	return a.Capacity == b.Capacity && a.Used == b.Used && a.Layout == b.Layout && a.GroupWidth == b.GroupWidth &&
+		slices.Equal(a.Disks, b.Disks) && slices.Equal(a.ReadCacheDisks, b.ReadCacheDisks) &&
+		slices.Equal(a.WriteCacheDisks, b.WriteCacheDisks)
 }
 
 func poolDiskItems(disks []domain.PoolDiskStatus) []PoolDiskItem {

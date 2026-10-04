@@ -534,7 +534,7 @@ func (s TerminalService) Move(ctx context.Context, req MoveTerminalsRequest) (Mo
 		}
 	}
 	for _, id := range ids {
-		if terminal, ok := terminalsByID[id]; ok && terminal.IsSuper {
+		if terminal, ok := terminalsByID[id]; ok && terminal.IsSuper && terminal.GroupID != targetID {
 			return MoveTerminalsResult{}, superModeRefusal(terminal, "移动客户机到其他分组")
 		}
 	}
@@ -851,8 +851,6 @@ func (s TerminalService) executeStopSuper(ctx context.Context, task domain.Task,
 	}
 	// 存还原点不改超管状态：机器仍是超管机，开机可接着装；结束编辑走「取消超管」，那里会连盘一起丢弃。
 	// 因此在取消超管前，它仍占着这些配置：别人不能在同配置开超管，镜像页也不能直接给这些配置建还原点。
-	terminal.PendingBundleID = nil // 驱动包已随本次保存固化
-	terminal.PendingBundleAt = nil
 	var result SuperStopResult
 	if reductionName != "" {
 		reduction := saved.System
@@ -900,7 +898,13 @@ func (s TerminalService) executeStopSuper(ctx context.Context, task domain.Task,
 				return err
 			}
 		}
-		if err := tx.Terminals().Update(ctx, terminal); err != nil {
+		// 重读再改：等关机期间终端可能被改过，不能用开始时读到的整行覆盖。
+		current, err := tx.Terminals().Get(ctx, terminal.ID)
+		if err != nil {
+			return err
+		}
+		current.PendingBundleID, current.PendingBundleAt = nil, nil // 驱动包已随本次保存固化
+		if err := tx.Terminals().Update(ctx, current); err != nil {
 			return err
 		}
 		taskResult := terminal.MAC
