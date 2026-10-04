@@ -559,13 +559,19 @@ type ExportImageResult struct {
 	Node   string `json:"node"`
 }
 
-// ExportImageToDir 把导出流写入本节点的导入目录，盘到盘不经网络。代价是文件落在当前
-// 写入者这一台上，控制台会写明是哪台。导出中途角色切换则任务失败，不在无人关注的节点上完成。
+// ExportImageToDir 把镜像原始内容导出到本节点的导入目录，见 exportToDir。
 func (s ImageService) ExportImageToDir(ctx context.Context, req ImageExportRequest) (ExportImageResult, error) {
 	img, err := s.exportableImage(ctx, req.ImageID)
 	if err != nil {
 		return ExportImageResult{}, err
 	}
+	return s.exportToDir(ctx, img, img.ID, img.Name, storage.ExportImageReq{ImageID: img.ID})
+}
+
+// exportToDir 把导出流写入本节点的导入目录，盘到盘不经网络。代价是文件落在当前写入者这一台上，
+// 结果里写明是哪台。导出中途角色切换则任务失败，不在无人关注的节点上完成。
+// sizeOf 是估算大小用的数据集（镜像或配置），name 是文件名和提示里的导出对象。
+func (s ImageService) exportToDir(ctx context.Context, img domain.Image, sizeOf, name string, req storage.ExportImageReq) (ExportImageResult, error) {
 	dir, err := s.importDir(ctx)
 	if err != nil {
 		return ExportImageResult{}, err
@@ -573,11 +579,11 @@ func (s ImageService) ExportImageToDir(ctx context.Context, req ImageExportReque
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return ExportImageResult{}, err
 	}
-	if err := s.ensureExportFits(ctx, img, dir); err != nil {
+	if err := s.ensureExportFits(ctx, sizeOf, name, dir); err != nil {
 		return ExportImageResult{}, err
 	}
-	path := filepath.Join(dir, sanitizeExportName(img.Name)+".zfs")
-	// 建任务前先占住文件名，否则同一镜像的两次导出都会启动，失败的一方留下看似可导入的截断文件。
+	path := filepath.Join(dir, sanitizeExportName(name)+".zfs")
+	// 建任务前先占住文件名，否则同一对象的两次导出都会启动，失败的一方留下看似可导入的截断文件。
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		if os.IsExist(err) {
@@ -596,7 +602,7 @@ func (s ImageService) ExportImageToDir(ctx context.Context, req ImageExportReque
 	}
 	run := func() {
 		defer done()
-		if err := s.executeExportImage(context.Background(), task, img, path); err != nil {
+		if err := s.executeExport(context.Background(), task, req, path); err != nil {
 			_ = s.runner().Fail(context.Background(), task, err)
 		}
 	}
@@ -608,7 +614,7 @@ func (s ImageService) ExportImageToDir(ctx context.Context, req ImageExportReque
 	return ExportImageResult{TaskID: task.ID, Path: path, Node: s.NodeAddr}, nil
 }
 
-func (s ImageService) executeExportImage(ctx context.Context, task domain.Task, img domain.Image, path string) error {
+func (s ImageService) executeExport(ctx context.Context, task domain.Task, req storage.ExportImageReq, path string) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		if os.IsExist(err) {
@@ -618,32 +624,30 @@ func (s ImageService) executeExportImage(ctx context.Context, task domain.Task, 
 	}
 	lastPercent := -1
 	var lastWritten int64
-	err = s.Storage.ExportImage(ctx, storage.ExportImageReq{
-		ImageID: img.ID,
-		W:       f,
-		OnProgress: func(written, estimated int64) {
-			// 每变化 1% 更新一次任务；没有估算值时百分比停在 99，改为每 256 MiB 更新。
-			percent := 99
-			if estimated > 0 {
-				if p := int(written * 100 / estimated); p < percent {
-					percent = p
-				}
+	req.W = f
+	req.OnProgress = func(written, estimated int64) {
+		// 每变化 1% 更新一次任务；没有估算值时百分比停在 99，改为每 256 MiB 更新。
+		percent := 99
+		if estimated > 0 {
+			if p := int(written * 100 / estimated); p < percent {
+				percent = p
 			}
-			if percent == lastPercent && written-lastWritten < 256<<20 {
-				return
-			}
-			lastPercent, lastWritten = percent, written
-			t := task
-			t.Status = domain.TaskStatusRunning
-			t.Progress = percent
-			if estimated > 0 {
-				t.Message = fmt.Sprintf("已导出 %s / 约 %s", fmtBytes(written), fmtBytes(estimated))
-			} else {
-				t.Message = "已导出 " + fmtBytes(written)
-			}
-			_ = s.Store.Tasks().Update(ctx, t)
-		},
-	})
+		}
+		if percent == lastPercent && written-lastWritten < 256<<20 {
+			return
+		}
+		lastPercent, lastWritten = percent, written
+		t := task
+		t.Status = domain.TaskStatusRunning
+		t.Progress = percent
+		if estimated > 0 {
+			t.Message = fmt.Sprintf("已导出 %s / 约 %s", fmtBytes(written), fmtBytes(estimated))
+		} else {
+			t.Message = "已导出 " + fmtBytes(written)
+		}
+		_ = s.Store.Tasks().Update(ctx, t)
+	}
+	err = s.Storage.ExportImage(ctx, req)
 	closeErr := f.Close()
 	if err == nil {
 		err = closeErr
@@ -701,10 +705,10 @@ func (s ImageService) streamExport(ctx context.Context, req storage.ExportImageR
 
 // ensureExportFits 拒绝预估大小超过导入目录剩余空间的导出。只在确定放不下时拒绝，
 // 估算或 statfs 失败则交给导出本身报真实错误。
-func (s ImageService) ensureExportFits(ctx context.Context, img domain.Image, dir string) error {
-	need, err := s.Storage.ExportImageSize(ctx, img.ID)
+func (s ImageService) ensureExportFits(ctx context.Context, sizeOf, name, dir string) error {
+	need, err := s.Storage.ExportImageSize(ctx, sizeOf)
 	if err != nil || need <= 0 {
-		slog.Warn("export space check skipped", "image", img.ID, "error", err)
+		slog.Warn("export space check skipped", "dataset", sizeOf, "error", err)
 		return nil
 	}
 	free, err := s.dirFree(dir)
@@ -716,7 +720,7 @@ func (s ImageService) ensureExportFits(ctx context.Context, img domain.Image, di
 		return nil
 	}
 	return errs.Conflict(fmt.Sprintf("导出目录空间不足：导出「%s」约需 %s，%s 所在磁盘仅剩 %s。请先清理该目录，或改用「下载到本地」",
-		img.Name, fmtBytes(need), dir, fmtBytes(free)))
+		name, fmtBytes(need), dir, fmtBytes(free)))
 }
 
 func (s ImageService) dirFree(dir string) (int64, error) {

@@ -174,7 +174,7 @@ function PageStorage() {
   const selected = pools.find(p => p.ID === selectedId) || null;
 
   const filtered = pools.filter(p => {
-    if (filterRole !== "all" && (p.Role || "") !== (filterRole === "none" ? "" : filterRole)) return false;
+    if (filterRole !== "all" && p.Role !== filterRole) return false;
     if (filterHealth === "all") return true;
     const up = String(p.Health || "").toUpperCase();
     if (filterHealth === "online") return up === "ONLINE";
@@ -320,7 +320,6 @@ function PageStorage() {
           { value: "all", label: "全部" },
           { value: "data", label: "数据池" },
           { value: "backup", label: "备份池" },
-          { value: "none", label: "未指定" },
         ]} style={{ width: 120 }}/>
         <div style={{ flex: 1 }}/>
         <button className="btn ghost icon" onClick={() => load()} title="立即刷新" aria-label="立即刷新"><Icons.Refresh size={13}/></button>

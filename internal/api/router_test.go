@@ -2211,9 +2211,23 @@ func TestExportToDirNeedsNoBody(t *testing.T) {
 	}
 }
 
+func TestExportReductionToDirNeedsNoBody(t *testing.T) {
+	service := &fakeExportDirService{}
+	router := newRouter(Services{Images: service})
+	rec := do(router, http.MethodPost, "/api/reductions/red-1/export", "")
+	if rec.Code != http.StatusAccepted || service.exportedID != "red-1" || !strings.Contains(rec.Body.String(), "192.168.10.3") {
+		t.Fatalf("status = %d, exported = %q, body %s", rec.Code, service.exportedID, rec.Body.String())
+	}
+}
+
 type fakeExportDirService struct {
 	ImageImportService
 	exportedID string
+}
+
+func (s *fakeExportDirService) ExportReductionToDir(_ context.Context, id string) (assets.ExportImageResult, error) {
+	s.exportedID = id
+	return assets.ExportImageResult{TaskID: "task-1", Path: "/var/lib/ndiskless/imports/Win 11-0.zfs", Node: "192.168.10.3"}, nil
 }
 
 func (s *fakeExportDirService) ExportImageToDir(_ context.Context, req assets.ImageExportRequest) (assets.ExportImageResult, error) {

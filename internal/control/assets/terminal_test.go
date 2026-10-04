@@ -228,8 +228,14 @@ func TestTerminalServiceAutoAllocateReportsFullRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := service.Create(ctx, TerminalRequest{MAC: "00:11:22:33:44:66", GroupID: group.ID})
-	if !errors.Is(err, ErrTerminalNoAvailableIP) {
+	if !errors.Is(err, ErrTerminalNoAvailableIP) || !errors.Is(err, errs.ErrConflict) {
 		t.Fatalf("full range err = %v", err)
+	}
+	// 操作者要知道是哪个分组、哪段地址满了，以及该去哪里改。
+	for _, want := range []string{"「" + group.Name + "」", group.StartIP, "最大客户机数", "其他分组"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("报错缺少 %q：%v", want, err)
+		}
 	}
 }
 

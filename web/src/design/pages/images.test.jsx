@@ -74,6 +74,7 @@ describe('镜像页', () => {
     await openDetail();
 
     await userEvent.click(screen.getByRole('button', { name: /导出镜像/ }));
+    expect(screen.getByText(/导出内容为镜像导入时的初始数据/)).toBeTruthy();
     await userEvent.click(screen.getByRole('button', { name: /下载到本地/ }));
     await waitFor(() => expect(exportImageTicket).toHaveBeenCalledWith('win11', false));
     expect(click).toHaveBeenCalled();
@@ -309,24 +310,16 @@ describe('还原点页', () => {
     await waitFor(() => expect(within(table).queryByText('装完office')).toBeNull());
   });
 
-  it('新建还原点把输入的名字原样交给后端，可勾选立即应用，名字为空不提交', async () => {
-    const createReduction = vi.fn(async () => ({ task_id: 'task-create_reduction-1' }));
-    stubApi({ createReduction });
+  // 配置内容只随超管机保存或数据盘发布变化，二者都会自动生成还原点；手动新建只会复制出最新还原点的同内容副本，
+  // 还容易被误认为保存了「当前应用的还原点」，所以界面不再提供入口（接口保留给测试工具）。
+  it('配置页和还原点页都不提供「新建还原点」', async () => {
     renderPage();
     await openTab('还原点');
     await screen.findByText('装完office');
-    await userEvent.click(screen.getByRole('button', { name: '新建还原点' }));
-    await userEvent.type(await screen.findByPlaceholderText('2026Q1-stable'), '装完CAD');
-    await userEvent.click(screen.getByRole('button', { name: '创建' }));
-    expect(createReduction).not.toHaveBeenCalled(); // 全部视图下没选配置
-    await userEvent.selectOptions(screen.getByLabelText('所属配置'), 'win11_default');
-    await userEvent.clear(screen.getByPlaceholderText('2026Q1-stable'));
-    await userEvent.click(screen.getByRole('button', { name: '创建' }));
-    expect(createReduction).not.toHaveBeenCalled(); // 名字为空
-    await userEvent.type(screen.getByPlaceholderText('2026Q1-stable'), '装完CAD');
-    await userEvent.click(screen.getByLabelText('创建后立即应用'));
-    await userEvent.click(screen.getByRole('button', { name: '创建' }));
-    await waitFor(() => expect(createReduction).toHaveBeenCalledWith('win11_default', { name: '装完CAD', set_current: true }));
+    expect(screen.queryByRole('button', { name: /新建还原点/ })).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: /^配置/ }));
+    await screen.findByRole('button', { name: /新建配置/ });
+    expect(screen.queryByRole('button', { name: /新建还原点/ })).toBeNull();
   });
 
   it('一键应用', async () => {
@@ -353,15 +346,35 @@ describe('还原点页', () => {
     await waitFor(() => expect(saveReductionAsImage).toHaveBeenCalledWith('win11_default_office', { name: '办公版' }));
   });
 
-  it('导出为镜像文件走一次性票据', async () => {
-    const exportReductionTicket = vi.fn(async () => ({ url: '/api/images/export-download?token=t', file_name: 'x.zfs' }));
+  // 和镜像导出共用同一个弹窗，只是导出对象不同。
+  it('导出为镜像文件走一次性票据，可选 gzip', async () => {
+    const exportReductionTicket = vi.fn(async () => ({ url: '/api/images/export-download?token=t', file_name: 'x.zfs.gz' }));
     stubApi({ exportReductionTicket });
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
     renderPage();
     await openTab('还原点');
     await userEvent.click(await screen.findByRole('button', { name: '导出为镜像文件 装完office' }));
-    await userEvent.click(await screen.findByRole('button', { name: /下载到本地/ }));
-    await waitFor(() => expect(exportReductionTicket).toHaveBeenCalledWith('win11_default_office', false));
+    expect(await screen.findByText(/导出内容为该还原点的完整磁盘数据/)).toBeTruthy();
+    await userEvent.click(screen.getByLabelText('gzip 压缩'));
+    await userEvent.click(screen.getByRole('button', { name: /下载到本地/ }));
+    await waitFor(() => expect(exportReductionTicket).toHaveBeenCalledWith('win11_default_office', true));
+  });
+
+  it('还原点也可以导出到服务器目录', async () => {
+    const exportReduction = vi.fn(async () => ({ task_id: 't3', path: '/var/lib/ndiskless/imports/Win 11-装完office.zfs', node: '192.168.10.3' }));
+    stubApi({ exportReduction });
+    renderPage();
+    await openTab('还原点');
+    await userEvent.click(await screen.findByRole('button', { name: '导出为镜像文件 装完office' }));
+    await userEvent.click(await screen.findByRole('button', { name: /导出到服务器目录/ }));
+    await waitFor(() => expect(exportReduction).toHaveBeenCalledWith('win11_default_office'));
+    expect(await screen.findByText(/目标文件：192\.168\.10\.3 上的/)).toBeTruthy();
+  });
+
+  it('镜像详情不再放「分配到分组」：它只是跳到分组页，分组绑定在分组页里做', async () => {
+    renderPage();
+    await openDetail();
+    expect(screen.queryByRole('button', { name: '分配到分组' })).toBeNull();
   });
 
   it('覆盖原镜像先说清后果再做', async () => {
@@ -658,7 +671,7 @@ describe('服务器目录进出', () => {
     await userEvent.click(screen.getByRole('button', { name: /导出镜像/ }));
     await userEvent.click(screen.getByRole('button', { name: /导出到服务器目录/ }));
     await waitFor(() => expect(exportImage).toHaveBeenCalledWith('win11'));
-    expect(await screen.findByText(/已开始导出到 192\.168\.10\.3 的 \/var\/lib\/ndiskless\/imports\/Win 11\.zfs/)).toBeTruthy();
+    expect(await screen.findByText(/导出任务已提交，目标文件：192\.168\.10\.3 上的 \/var\/lib\/ndiskless\/imports\/Win 11\.zfs/)).toBeTruthy();
   });
 });
 

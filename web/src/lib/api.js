@@ -85,6 +85,7 @@ export const api = {
   setImagePurpose: (id, body) => request(`/api/images/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
   listImportSources: () => request('/api/images/import-sources'),
   exportImage: (id) => request(`/api/images/${encodeURIComponent(id)}/export`, { method: 'POST' }),
+  exportReduction: (id) => request(`/api/reductions/${encodeURIComponent(id)}/export`, { method: 'POST' }),
   deleteImage: (id) => request(`/api/images/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // 从本机上传镜像：分片 + 断点续传，几十 G 的文件不能一次 POST。
   beginUpload: (body) => request('/api/images/uploads', { method: 'POST', body }),
@@ -167,8 +168,6 @@ export const api = {
   saveReductionAsImage: (id, body) =>
     request(`/api/reductions/${encodeURIComponent(id)}/save-as-image`, { method: 'POST', body }),
   overwriteImage: (id) => request(`/api/reductions/${encodeURIComponent(id)}/overwrite-image`, { method: 'POST' }),
-  createReduction: (configId, body) =>
-    request(`/api/configs/${encodeURIComponent(configId)}/reductions`, { method: 'POST', body }),
   mergeReductions: (configId, body) =>
     request(`/api/configs/${encodeURIComponent(configId)}/reductions/merge`, { method: 'POST', body }),
   deleteReduction: (reductionId) =>

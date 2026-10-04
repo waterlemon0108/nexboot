@@ -2,6 +2,7 @@ package assets
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -274,10 +275,19 @@ func allocateIPFromGroup(group domain.Group, occupied map[uint32]bool) (string, 
 	}
 	ip, ok := pool.allocate(occupied)
 	if !ok {
-		return "", ErrTerminalNoAvailableIP
+		return "", groupFullError{group: group.Name, from: ipv4String(pool.start), to: ipv4String(pool.end)}
 	}
 	return ip, nil
 }
+
+// groupFullError 点名哪个分组、哪段地址已用完以及怎么办；仍算 ErrTerminalNoAvailableIP。
+type groupFullError struct{ group, from, to string }
+
+func (e groupFullError) Error() string {
+	return fmt.Sprintf("分组「%s」没有空闲地址（%s–%s 已全部分配）。请在「分组管理」中调大该组的最大客户机数，或改选其他分组", e.group, e.from, e.to)
+}
+
+func (e groupFullError) Is(target error) bool { return errors.Is(ErrTerminalNoAvailableIP, target) }
 
 func parseBool(value string) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {

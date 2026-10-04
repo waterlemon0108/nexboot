@@ -59,6 +59,7 @@ type ImageImportService interface {
 	SetPurpose(context.Context, string, assets.SetPurposeRequest) (domain.Image, error)
 	ListImportSources(context.Context) (assets.ImportSourceListResult, error)
 	ExportImageToDir(context.Context, assets.ImageExportRequest) (assets.ExportImageResult, error)
+	ExportReductionToDir(context.Context, string) (assets.ExportImageResult, error)
 	ListImages(context.Context) (assets.ImageListResult, error)
 	GetImage(context.Context, string) (assets.ImageDetail, error)
 	DeleteImage(context.Context, string) error
@@ -716,6 +717,7 @@ func registerAPIRoutes(r chi.Router, svc Services, tickets *exportTickets) {
 		r.Delete("/api/images/{id}", handleErrID(svc.Images.DeleteImage, notFound("镜像不存在")))
 		r.Post("/api/images/{id}/export-ticket", exportTicketHandler(svc.Images, tickets))
 		r.Post("/api/reductions/{id}/export-ticket", reductionExportTicketHandler(svc.Images, tickets))
+		r.Post("/api/reductions/{id}/export", handleID(svc.Images.ExportReductionToDir, status(http.StatusAccepted), notFound("还原点不存在")))
 		r.Post("/api/reductions/{id}/save-as-image", handleIDIn(svc.Images.SaveReductionAsImage, status(http.StatusAccepted), notFound("还原点不存在")))
 		r.Post("/api/images/{id}/health-check", handleID(svc.Images.RunHealthCheck, status(http.StatusAccepted), notFound("镜像不存在")))
 		r.Get("/api/images/{id}/health", handleID(svc.Images.GetHealth, notFound("体检报告不存在")))

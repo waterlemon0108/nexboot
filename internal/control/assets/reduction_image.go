@@ -58,6 +58,16 @@ func (s ImageService) StreamReduction(ctx context.Context, reductionID string, w
 	return s.streamExport(ctx, storage.ExportImageReq{ConfigID: red.ConfigID, Snapshot: strings.TrimPrefix(red.Name, "@")}, w, compress)
 }
 
+// ExportReductionToDir 把还原点导出到本节点的导入目录，见 exportToDir。
+func (s ImageService) ExportReductionToDir(ctx context.Context, reductionID string) (ExportImageResult, error) {
+	red, img, err := s.restorePointSource(ctx, reductionID)
+	if err != nil {
+		return ExportImageResult{}, err
+	}
+	return s.exportToDir(ctx, img, red.ConfigID, img.Name+"-"+displayNameOf(red),
+		storage.ExportImageReq{ConfigID: red.ConfigID, Snapshot: strings.TrimPrefix(red.Name, "@")})
+}
+
 // SaveReductionAsImage 把还原点完整复制成独立镜像，之后两者可各自删除。
 func (s ImageService) SaveReductionAsImage(ctx context.Context, reductionID string, req SaveAsImageRequest) (ImportImageResult, error) {
 	name := strings.TrimSpace(req.Name)

@@ -72,3 +72,33 @@ func seedExportImage(t *testing.T, st *store.SQLStore, id string) {
 		t.Fatal(err)
 	}
 }
+
+// 还原点也能盘对盘导出到服务器目录，落点和镜像导出一样写明是哪台节点。
+func TestExportReductionToDirWritesTheRestorePoint(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	dir := t.TempDir()
+	seedGroupTriple(t, ctx, st, "win11", "cfg-1", "red-1")
+	fake := &fakeImageStorage{exportData: []byte("stream")}
+	svc := ImageService{Store: st, Storage: fake, ImportDir: dir, NodeAddr: "192.168.10.3", Async: false}
+
+	res, err := svc.ExportReductionToDir(ctx, "red-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(res.Path) != dir || !strings.HasPrefix(filepath.Base(res.Path), "win11-") || !strings.HasSuffix(res.Path, ".zfs") {
+		t.Fatalf("落点不对：%q", res.Path)
+	}
+	if res.Node != "192.168.10.3" {
+		t.Fatalf("没写明是哪台：%#v", res)
+	}
+	if fake.exportReq.ConfigID != "cfg-1" || fake.exportReq.Snapshot != "0" {
+		t.Fatalf("导出的不是这个还原点：%#v", fake.exportReq)
+	}
+	if b, err := os.ReadFile(res.Path); err != nil || string(b) != "stream" {
+		t.Fatalf("文件没写对：%q %v", b, err)
+	}
+	if task, err := st.Tasks().Get(ctx, res.TaskID); err != nil || task.Status != domain.TaskStatusSuccess {
+		t.Fatalf("任务 = %#v %v", task, err)
+	}
+}

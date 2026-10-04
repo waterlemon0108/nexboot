@@ -120,7 +120,6 @@ export function ConfigsTab({ images, onShowReductions }) {
                   <td style={{ maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis" }}><UsageCell users={cfg.users}/></td>
                   <td className="mono muted" style={{ fontSize: 12 }}>{fmtDateTime(cfg.CreatedAt)}</td>
                   <td className="t-actions"><div>
-                    <button className="btn" style={{ padding: "3px 8px" }} onClick={() => setModal({ kind: "reduction", configId: cfg.ID })}>新建还原点</button>
                     <button className="btn ghost icon danger" disabled={onlyConfig} onClick={() => doDelete(cfg)} aria-label={`删除配置 ${cfg.Name}`}
                       title={onlyConfig ? `这是镜像 ${imageName(cfg.ImageID)} 的最后一个配置，不能删除；不要这个镜像了请直接删除镜像` : "删除配置"}><Icons.Trash size={12}/></button>
                   </div></td>
@@ -133,7 +132,6 @@ export function ConfigsTab({ images, onShowReductions }) {
         <Pager {...paged.pager}/>
       </div>
       {modal?.kind === "config" && <NewConfigModal images={images} catalogue={all} defaultImage={imageF} busy={busy} run={run} onClose={() => setModal(null)} onDone={reload}/>}
-      {modal?.kind === "reduction" && <NewReductionModal configId={modal.configId} busy={busy} run={run} onClose={() => setModal(null)} onDone={reload}/>}
       {conf.node}
     </>
   );
@@ -196,36 +194,6 @@ function NewConfigModal({ images, catalogue, defaultImage, busy, run, onClose, o
         </div>
       </Field>
       <div className="hint">新配置与起点互不影响，各改各的。{form.from === "config" && "只要新配置还在，作为起点的那个还原点就不能删除。"}</div>
-    </Modal>
-  );
-}
-
-// 给了 configId 就固定该配置；否则从 choices（{ value, label }）里选，不预选。
-function NewReductionModal({ configId, choices, busy, run, onClose, onDone }) {
-  const store = useStore();
-  const [form, setForm] = useState({ name: "", set_current: false, configId: configId || "" });
-  const submit = async () => {
-    const name = form.name.trim();
-    if (!form.configId) { store.toast("请选择所属配置", "err"); return; }
-    if (!name) { store.toast("请输入还原点名称", "err"); return; }
-    if (await run(() => api.createReduction(form.configId, { name, set_current: !!form.set_current }), "还原点创建任务已提交", { reload: onDone, errMsg: "创建失败" })) onClose();
-  };
-  return (
-    <Modal open onClose={() => !busy && onClose()} title="新建还原点"
-      footer={<><button className="btn" disabled={busy} onClick={onClose}>取消</button><button className="btn primary" disabled={busy} onClick={submit}>{busy ? "提交中…" : "创建"}</button></>}>
-      {!configId && (
-        <Field label="所属配置" required>
-          <Select aria-label="所属配置" value={form.configId} onChange={v => setForm({ ...form, configId: v })}
-            options={[{ value: "", label: "请选择配置" }, ...(choices || [])]}/>
-        </Field>
-      )}
-      <Field label="还原点名称" required hint="给配置当前的内容打一个还原点">
-        <input className="input" style={{ width: "100%" }} value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="2026Q1-stable"/>
-      </Field>
-      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer" }}>
-        <input type="checkbox" checked={form.set_current} onChange={e => setForm({ ...form, set_current: e.target.checked })} aria-label="创建后立即应用"/>
-        创建后立即应用
-      </label>
     </Modal>
   );
 }
@@ -308,7 +276,6 @@ export function RestorePointsTab({ images, imageId, configId, onPick }) {
         <SearchBox value={q} onChange={setQ} placeholder="搜索还原点名称" width={200}/>
         <div style={{ flex: 1 }}/>
         <button className="btn danger" disabled={!chosen.length} onClick={deleteSelected}><Icons.Trash size={12}/> 删除所选{chosen.length ? ` (${chosen.length})` : ""}</button>
-        <button className="btn primary" disabled={!catalogue.length} onClick={() => setModal({ kind: "reduction" })}><Icons.Plus size={12}/> 新建还原点</button>
       </div>
       <div className="card" style={{ padding: 0 }}>
         <div style={{ overflowX: "auto" }}><table className="t">
@@ -357,10 +324,12 @@ export function RestorePointsTab({ images, imageId, configId, onPick }) {
         </table></div>
         <Pager {...paged.pager}/>
       </div>
-      {modal?.kind === "reduction" && <NewReductionModal configId={configId || ""} busy={busy} run={run} onClose={() => setModal(null)} onDone={reload}
-        choices={configChoices.map(c => ({ value: c.ID, label: `${imageOf(c.ImageID)?.Name || c.ImageID} / ${c.Name}` }))}/>}
       {modal?.kind === "saveAs" && <SaveAsImageModal rp={modal.rp} image={imageOf(modal.rp.cfg.ImageID)} busy={busy} run={run} onClose={() => setModal(null)}/>}
-      {modal?.kind === "export" && <ExportRestorePointModal rp={modal.rp} image={imageOf(modal.rp.cfg.ImageID)} busy={busy} run={run} onClose={() => setModal(null)}/>}
+      {modal?.kind === "export" && <ExportModal busy={busy} run={run} onClose={() => setModal(null)}
+        title={`导出还原点 · ${imageOf(modal.rp.cfg.ImageID)?.Name || modal.rp.cfg.ImageID} / ${redName(modal.rp)}`}
+        source="导出内容为该还原点的完整磁盘数据。"
+        ticket={(gzip) => api.exportReductionTicket(modal.rp.ID, gzip)}
+        toDir={() => api.exportReduction(modal.rp.ID)}/>}
       {conf.node}
     </>
   );
@@ -405,30 +374,62 @@ function SaveAsImageModal({ rp, image, busy, run, onClose }) {
   );
 }
 
-function ExportRestorePointModal({ rp, image, busy, run, onClose }) {
+// ExportModal 是镜像与还原点共用的导出弹窗：两者导出的都是可再导入的 ZFS 数据流，差别只在来源。
+// ticket(gzip) 换取一次性下载地址；toDir 可选，提供时显示「导出到服务器目录」。
+export function ExportModal({ title, source, ticket, toDir, busy, run, onClose }) {
+  const store = useStore();
   const [gzip, setGzip] = useState(false);
+  // 用票据换普通 URL 交给浏览器下载；fetch+blob 会把整个镜像读进内存。
   const download = async () => {
     const ok = await run(async () => {
-      const t = await api.exportReductionTicket(rp.ID, gzip);
+      const t = await ticket(gzip);
       const a = document.createElement("a");
       a.href = t.url;
       document.body.appendChild(a);
       a.click();
       a.remove();
       return t;
-    }, "已开始下载，进度见浏览器的下载列表", { errMsg: "导出失败" });
+    }, "下载已开始，进度可在浏览器下载列表中查看", { errMsg: "导出失败" });
     if (ok) onClose();
   };
+  const exportToDir = async () => {
+    let r;
+    const ok = await run(async () => (r = await toDir()), null, { errMsg: "导出失败" });
+    if (ok) {
+      store.toast(`导出任务已提交，目标文件：${r.node || "当前主机"} 上的 ${r.path}`, "ok");
+      onClose();
+    }
+  };
   return (
-    <Modal open onClose={() => !busy && onClose()} title={`导出为镜像文件 · ${image?.Name || ""} / ${redName(rp)}`} size="sm"
-      footer={<><button className="btn" disabled={busy} onClick={onClose}>取消</button><button className="btn primary" disabled={busy} onClick={download}><Icons.Download size={12}/> 下载到本地</button></>}>
+    <Modal open onClose={() => !busy && onClose()} title={title} size="sm">
       <div className="hint" style={{ marginBottom: 12 }}>
-        导出为 {gzip ? ".zfs.gz" : ".zfs"} 镜像文件，内容是这个还原点。可在任意一套系统的「导入镜像」里导入。
+        {source}文件格式为 ZFS 数据流（.zfs，启用压缩时为 .zfs.gz），可在任一服务器的「导入镜像」中导入。
       </div>
-      <label className="row" style={{ gap: 8, fontSize: 13, cursor: "pointer" }}>
-        <input type="checkbox" checked={gzip} onChange={e => setGzip(e.target.checked)} aria-label="gzip 压缩"/>
-        gzip 压缩（文件更小，导出更慢）
-      </label>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer" }}>
+          <input type="checkbox" checked={gzip} disabled={busy} onChange={e => setGzip(e.target.checked)} aria-label="gzip 压缩"/>
+          gzip 压缩
+        </label>
+        <span className="hint" style={{ marginTop: -4 }}>
+          数据流已包含存储池压缩，启用 gzip 通常可再减小 30%–50% 的体积，但会增加服务器 CPU 开销。导入时自动识别压缩格式。
+        </span>
+        <div className="row" style={{ gap: 10, alignItems: "flex-start" }}>
+          <button className="btn primary" style={{ flexShrink: 0, minWidth: 128 }} disabled={busy} onClick={download}>
+            <Icons.Download size={12}/> 下载到本地
+          </button>
+          <span className="hint" style={{ paddingTop: 4 }}>通过浏览器下载，进度可在浏览器下载列表中查看；传输中断后需重新下载。</span>
+        </div>
+        {toDir && (
+          <div className="row" style={{ gap: 10, alignItems: "flex-start" }}>
+            <button className="btn" style={{ flexShrink: 0, minWidth: 128 }} disabled={busy} onClick={exportToDir}>
+              <Icons.Server size={12}/> 导出到服务器目录
+            </button>
+            <span className="hint" style={{ paddingTop: 4 }}>
+              写入当前主机的导入目录，不经网络传输，适用于大容量镜像。此方式不支持 gzip 压缩；导出期间如发生主备切换，任务将失败，可在「任务中心」查看。
+            </span>
+          </div>
+        )}
+      </div>
     </Modal>
   );
 }

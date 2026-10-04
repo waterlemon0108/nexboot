@@ -5,7 +5,7 @@ import { Icons } from '../icons.jsx';
 import { useStore } from '../store.jsx';
 import { Modal, useConfirm } from '../overlay.jsx';
 import { Field, Select, TableState, SearchBox } from '../primitives.jsx';
-import { ConfigsTab, RestorePointsTab, loadConfigUsers, UsageCell } from './image-configs.jsx';
+import { ConfigsTab, RestorePointsTab, ExportModal, loadConfigUsers, UsageCell } from './image-configs.jsx';
 import { api } from '../../lib/api.js';
 import { fmtDateTime, redName } from '../../lib/format.js';
 import { useResource, useMutation, usePolling } from '../../lib/hooks.js';
@@ -59,8 +59,6 @@ function PageImages() {
   const [selImageId, setSelImageId] = useState(null);
 
   const [modal, setModal] = useState(null); // import | image | export | blank
-  // 默认不压缩：裸流已带池的压缩，局域网里 gzip 反而更慢。
-  const [exportGzip, setExportGzip] = useState(false);
   // 两条进出路径并存：浏览器受运维上行带宽限制；服务器目录快得多，但文件只在当前服务的那台上。
   const [importMode, setImportMode] = useState("upload");
   const [sources, setSources] = useState(null);
@@ -269,32 +267,6 @@ function PageImages() {
     await run(() => api.deleteImage(selImage.ID), "镜像已删除", { reload: loadImages, errMsg: "删除失败" });
   };
 
-  // 下载：用登录态换一次性票据，再交给浏览器普通 URL；fetch+blob 会把整个镜像读进内存。
-  const doExportDownload = async () => {
-    if (!selImage) return;
-    const ok = await run(async () => {
-      const t = await api.exportImageTicket(selImage.ID, exportGzip);
-      const a = document.createElement("a");
-      a.href = t.url;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      return t;
-    }, "已开始下载，进度见浏览器的下载列表", { errMsg: "导出失败" });
-    if (ok) setModal("image");
-  };
-
-  // 导出到服务器目录：结果里带着落在哪台、哪个路径，直接告诉运维。
-  const doExportToDir = async () => {
-    if (!selImage) return;
-    let r;
-    const ok = await run(async () => (r = await api.exportImage(selImage.ID)), null, { errMsg: "导出失败" });
-    if (ok) {
-      store.toast(`已开始导出到 ${r.node || "当前主机"} 的 ${r.path}`, "ok");
-      setModal("image");
-    }
-  };
-
   return (
     <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <div className="tabs">
@@ -374,7 +346,6 @@ function PageImages() {
 
       <Modal open={modal === "image"} onClose={() => setModal(null)} title={selImage ? selImage.Name : "镜像详情"} size="lg"
         footer={selImage && <>
-          <button className="btn" onClick={() => goto("groups")}>分配到分组</button>
           <button className="btn" onClick={() => setModal("export")}><Icons.Download size={12}/> 导出镜像</button>
           <button className="btn danger" onClick={doDeleteImage}><Icons.Trash size={12}/> 删除镜像</button>
         </>}>
@@ -396,41 +367,11 @@ function PageImages() {
       </Modal>
 
       {/* 导入镜像 */}
-      {/* 导出：一条可再导入的流，可选 gzip */}
-      <Modal open={modal === "export"} onClose={() => !busy && setModal("image")} title={selImage ? `导出镜像 · ${selImage.Name}` : "导出镜像"} size="sm">
-        <div className="hint" style={{ marginBottom: 12 }}>
-          导出为 {exportGzip ? ".zfs.gz" : ".zfs"} 镜像流文件，下载到本机后可在任意一台服务器的「导入镜像 · 从本机上传」里传回去
-          （导入时重新填写名称和系统类型）。导出的是镜像导入时的原始内容，配置与还原点里的改动不在其中；
-          要导出某个还原点，请到「还原点」页用「导出为镜像文件」。
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer" }}>
-            <input type="checkbox" checked={exportGzip} disabled={busy}
-                   onChange={e => setExportGzip(e.target.checked)} aria-label="gzip 压缩"/>
-            gzip 压缩
-          </label>
-          <span className="hint" style={{ marginTop: -4 }}>
-            镜像流本身已带存储池的压缩，gzip 通常还能再小三到五成，代价是导出时占用服务器 CPU。
-            导入时自动识别，不必解压。
-          </span>
-          <div className="row" style={{ gap: 10, alignItems: "flex-start" }}>
-            <button className="btn primary" style={{ flexShrink: 0, minWidth: 128 }} disabled={busy} onClick={doExportDownload}>
-              <Icons.Download size={12}/> 下载到本地
-            </button>
-            <span className="hint" style={{ paddingTop: 4 }}>浏览器直接下载，进度见下载列表。中断后需重新下载。</span>
-          </div>
-          {/* 盘对盘导出不经网络，快得多；文件落在当前服务的那台上，要说清是哪台。 */}
-          <div className="row" style={{ gap: 10, alignItems: "flex-start" }}>
-            <button className="btn" style={{ flexShrink: 0, minWidth: 128 }} disabled={busy} onClick={doExportToDir}>
-              <Icons.Server size={12}/> 导出到服务器目录
-            </button>
-            <span className="hint" style={{ paddingTop: 4 }}>
-              写到当前主机的导入目录，盘对盘、不经网络，大镜像快得多。导出过程中若发生主备切换，
-              任务会失败，可在任务页看到。gzip 选项对这条出口不生效。
-            </span>
-          </div>
-        </div>
-      </Modal>
+      {modal === "export" && selImage && <ExportModal busy={busy} run={run} onClose={() => setModal("image")}
+        title={`导出镜像 · ${selImage.Name}`}
+        source="导出内容为镜像导入时的初始数据，不包含各配置及还原点中的变更；如需导出某一还原点，请在「还原点」页签中操作。"
+        ticket={(gzip) => api.exportImageTicket(selImage.ID, gzip)}
+        toDir={() => api.exportImage(selImage.ID)}/>}
 
       <Modal open={modal === "import"} onClose={() => !busy && closeImport()} title="导入镜像"
         footer={<><button className="btn" disabled={busy} onClick={closeImport}>取消</button>

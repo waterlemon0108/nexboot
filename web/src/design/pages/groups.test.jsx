@@ -97,11 +97,9 @@ describe('分组页', () => {
     const sysOptions = [...sys.querySelectorAll('option')].map(o => o.value);
     expect(sysOptions).toContain('isharedisk');
     expect(sysOptions).not.toContain('games');
-    await userEvent.click(screen.getByRole('button', { name: '取消' }));
 
-    await userEvent.click(screen.getByRole('button', { name: /数据盘/ }));
-    await userEvent.click(await screen.findByText(/添加数据盘/));
-    const data = await screen.findByLabelText('数据盘镜像');
+    await userEvent.click(screen.getByRole('button', { name: /添加数据盘/ }));
+    const data = await screen.findByLabelText('新数据盘 1 的镜像');
     const dataOptions = [...data.querySelectorAll('option')].map(o => o.value);
     expect(dataOptions).toEqual(['games']); // 只有 Windows 数据盘
   });
@@ -257,5 +255,110 @@ describe('分组页', () => {
     expect(within(row).getByText(/运行中|在线/)).toBeTruthy();
     // 后果要如实写，不能只说「下次开机生效」
     expect(card.textContent).toMatch(/续租|断线|掉线/);
+  });
+
+  // 数据盘在新建 / 编辑弹窗里一起设置，不用建完分组再单独配一遍。
+  describe('数据盘随分组一起设置', () => {
+    const DATA_CONFIGS = { games: [{ ID: 'games_default', ImageID: 'games', Name: 'default' }] };
+    const configsOf = async (img) => list(DATA_CONFIGS[img] || CONFIGS);
+    const GROUP = { ID: 'g-1', Name: '教学一班', StartIP: '192.168.50.100', ClientMax: 10, Gateway: '192.168.50.1', Netmask: '255.255.255.0', SystemImageID: 'isharedisk', SystemConfigID: 'isharedisk_default' };
+
+    it('新建分组时一起添加数据盘，盘符默认填下一个空闲的', async () => {
+      const createGroup = vi.fn(async () => ({ ID: 'g-new' }));
+      const createGroupDisk = vi.fn(async () => ({}));
+      stubApi({ createGroup, createGroupDisk, listConfigs: configsOf });
+      renderPage();
+      await userEvent.click(await screen.findByRole('button', { name: /新建分组/ }));
+      await userEvent.type(await screen.findByLabelText('分组名称'), '电竞区');
+      await userEvent.click(screen.getByRole('button', { name: /添加数据盘/ }));
+      expect(screen.getByLabelText('新数据盘 1 的挂载目标').value).toBe('D:');
+      await waitFor(() => expect(screen.getByLabelText('新数据盘 1 的配置').value).toBe('games_default'));
+      await userEvent.click(screen.getByRole('button', { name: '保存' }));
+      await waitFor(() => expect(createGroupDisk).toHaveBeenCalledWith('g-new', { mount_target: 'D:', image_id: 'games', config_id: 'games_default' }));
+      expect(createGroup).toHaveBeenCalledTimes(1);
+    });
+
+    it('编辑时列出已有数据盘，可移除旧的、添加新的', async () => {
+      const updateGroup = vi.fn(async () => ({}));
+      const deleteGroupDisk = vi.fn(async () => null);
+      const createGroupDisk = vi.fn(async () => ({}));
+      stubApi({
+        listGroups: async () => list([GROUP]), listConfigs: configsOf, updateGroup, deleteGroupDisk, createGroupDisk,
+        listGroupDisks: async () => list([{ ID: 'gd-1', GroupID: 'g-1', MountTarget: 'D:', ImageID: 'games', ConfigID: 'games_default' }]),
+      });
+      renderPage();
+      await screen.findByText('教学一班');
+      // 卡片直接显示数据盘，不再要单独的「数据盘」按钮。
+      await waitFor(() => expect(screen.getByText('D:')).toBeTruthy());
+      expect(screen.queryByRole('button', { name: /^数据盘$/ })).toBeNull();
+
+      await userEvent.click(screen.getByRole('button', { name: /编辑/ }));
+      await screen.findByLabelText('分组名称');
+      await userEvent.click(screen.getByRole('button', { name: /添加数据盘/ }));
+      expect(screen.getByLabelText('新数据盘 1 的挂载目标').value).toBe('E:');
+      await userEvent.click(screen.getByRole('button', { name: '移除数据盘 D:' }));
+      await waitFor(() => expect(screen.getByLabelText('新数据盘 1 的配置').value).toBe('games_default'));
+      await userEvent.click(screen.getByRole('button', { name: '保存' }));
+      await waitFor(() => expect(createGroupDisk).toHaveBeenCalledWith('g-1', { mount_target: 'E:', image_id: 'games', config_id: 'games_default' }));
+      expect(updateGroup).toHaveBeenCalled();
+      expect(deleteGroupDisk).toHaveBeenCalledWith('gd-1');
+    });
+
+    it('卡片只列系统盘和数据盘，网络细节留在弹窗；数据盘说明点问号才展开', async () => {
+      stubApi({
+        listGroups: async () => list([GROUP]), listConfigs: configsOf,
+        listGroupDisks: async () => list([{ ID: 'gd-1', GroupID: 'g-1', MountTarget: 'D:', ImageID: 'games', ConfigID: 'games_default' }]),
+      });
+      renderPage();
+      await screen.findByText('教学一班');
+      await waitFor(() => expect(screen.getByText('D:')).toBeTruthy());
+      expect(screen.queryByText('子网掩码')).toBeNull();
+      await userEvent.click(screen.getByRole('button', { name: /编辑/ }));
+      await screen.findByLabelText('分组名称');
+      expect(screen.queryByText(/随系统盘一起挂载的附加盘/)).toBeNull();
+      await userEvent.click(screen.getByRole('button', { name: '数据盘说明' }));
+      expect(screen.getByText(/随系统盘一起挂载的附加盘/)).toBeTruthy();
+    });
+
+    // 右上角三个数各带标签：在线 / 已分配 / 容量；按钮不再带数字，免得和它们混淆。
+    it('右上角是在线 / 已分配 / 容量，满员时容量标出来', async () => {
+      stubApi({
+        listGroups: async () => list([{ ...GROUP, ClientMax: 2 }]), listConfigs: configsOf,
+        listTerminals: async () => list([
+          { ID: 't1', Name: '01', MAC: 'AA', GroupID: 'g-1', State: 'online' },
+          { ID: 't2', Name: '02', MAC: 'BB', GroupID: 'g-1', State: 'offline' },
+        ]),
+      });
+      renderPage();
+      const card = (await screen.findByText('教学一班')).closest('.card');
+      const stat = (label) => within(card).getByText(label).parentElement.textContent;
+      await waitFor(() => expect(stat('在线')).toBe('1在线'));
+      expect(stat('已分配')).toBe('2已分配');
+      expect(stat('容量')).toBe('2容量');
+      expect(within(card).getByText('容量').parentElement.getAttribute('title')).toMatch(/已满/);
+      expect(within(card).getByRole('button', { name: /查看终端/ })).toBeTruthy();
+    });
+
+    it('分组建好了但数据盘没加上：弹窗转为编辑，再保存只补加数据盘，不重复建分组', async () => {
+      const createGroup = vi.fn(async () => ({ ID: 'g-new' }));
+      const updateGroup = vi.fn(async () => ({}));
+      let fail = true;
+      const createGroupDisk = vi.fn(async () => { if (fail) throw new Error('挂载目标重复'); return {}; });
+      stubApi({ createGroup, updateGroup, createGroupDisk, listConfigs: configsOf });
+      renderPage();
+      await userEvent.click(await screen.findByRole('button', { name: /新建分组/ }));
+      await userEvent.type(await screen.findByLabelText('分组名称'), '电竞区');
+      await userEvent.click(screen.getByRole('button', { name: /添加数据盘/ }));
+      await waitFor(() => expect(screen.getByLabelText('新数据盘 1 的配置').value).toBe('games_default'));
+      await userEvent.click(screen.getByRole('button', { name: '保存' }));
+      expect(await screen.findByText(/分组已创建，数据盘 D: 未添加/)).toBeTruthy();
+      expect(screen.getByText('编辑分组')).toBeTruthy();
+
+      fail = false;
+      await userEvent.click(screen.getByRole('button', { name: '保存' }));
+      await waitFor(() => expect(createGroupDisk).toHaveBeenCalledTimes(2));
+      expect(createGroup).toHaveBeenCalledTimes(1);
+      expect(updateGroup).toHaveBeenCalled();
+    });
   });
 });
