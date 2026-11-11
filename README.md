@@ -17,6 +17,14 @@
 
 </div>
 
+## Online demo
+
+[Open the demo](http://38.92.15.101:8080/) · Username: `demo` · Password: `demo`
+
+Explore menus, searches and detail views with simulated business data. Buttons for modifying data remain visible, but their actions are disabled. The demo runs independently of the real storage and diskless boot services.
+
+Login logs contain real visitor IP addresses, login times and client information, and are visible to all demo visitors. Do not enter personal or production passwords.
+
 ## Why NexBoot
 
 Keeping 50 or 500 PCs on the same Windows build is a chore. Every game patch, driver update or bad install means walking from seat to seat.
