@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -228,6 +229,144 @@ func cloneMACAndLUN(rest string) (mac string, lun int) {
 		return rest[:idx], lun
 	}
 	return rest, 0
+}
+
+// BackupRoot 是备份副本所在的容器，副本在 <备份池>/ndiskless/nd。
+const BackupRoot = "ndiskless"
+
+var (
+	asideRootName = regexp.MustCompile(`^nd-(rebuilding|diverged|held)-[0-9]+$`)
+	recvTempName  = regexp.MustCompile(`^recv-[0-9]+-[0-9]+$`)
+)
+
+// AsideKind 判断池顶层的名字是否为复制挪开的副本，返回 PreservedRebuilding、PreservedDiverged 或 PreservedHeld。
+func AsideKind(name string) (string, bool) {
+	m := asideRootName.FindStringSubmatch(name)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// IsRecvTemp 判断是否为被打断的接收留下的临时数据集（libzfs 起的 recv-<pid>-<seq>）。
+func IsRecvTemp(name string) bool { return recvTempName.MatchString(name) }
+
+// PoolObjectKind 是池内路径代表的对象类别。
+type PoolObjectKind string
+
+const (
+	PoolObjectContainer     PoolObjectKind = "container"      // 池根和 nd、run、ndiskless
+	PoolObjectReserved      PoolObjectKind = "reserved"       // nd/db、nd/files
+	PoolObjectCatalogue     PoolObjectKind = "catalogue"      // nd 下的镜像或配置
+	PoolObjectSuperseded    PoolObjectKind = "superseded"     // 超管保存中断留下的旧配置
+	PoolObjectRecvTemp      PoolObjectKind = "recv_temp"      // 被打断的接收留下的临时数据集
+	PoolObjectCarrier       PoolObjectKind = "carrier"        // run 下的客户机盘和临时克隆
+	PoolObjectRebuilding    PoolObjectKind = "rebuilding"     // 重建留下的旧副本
+	PoolObjectDiverged      PoolObjectKind = "diverged"       // 分叉副本
+	PoolObjectHeld          PoolObjectKind = "held"           // 主机已删、本机还有克隆依赖的暂存
+	PoolObjectAsideChild    PoolObjectKind = "aside_child"    // 挪开副本里的子数据集
+	PoolObjectBackupCopy    PoolObjectKind = "backup_copy"    // 备份池的整份副本
+	PoolObjectBackupItem    PoolObjectKind = "backup_item"    // 整份副本里的成员
+	PoolObjectBackupAside   PoolObjectKind = "backup_aside"   // 备份重建留下的旧副本
+	PoolObjectLegacyImports PoolObjectKind = "legacy_imports" // 旧版的 <池>/imports
+	PoolObjectUnknown       PoolObjectKind = "unknown"        // 认不出，只读
+)
+
+// PoolObject 是池内相对路径反解出的对象。Root 是它所属的挪开副本，Name 是容器下的名字。
+type PoolObject struct {
+	Kind    PoolObjectKind
+	Root    string
+	Name    string
+	Carrier Carrier
+}
+
+// ClassifyPoolPath 只凭名字判断池内相对路径是什么。认不出的一律归 PoolObjectUnknown：
+// 删除白名单也靠它，宁可不认识，也不能猜。
+func ClassifyPoolPath(rel string) PoolObject {
+	if rel == "" || rel == CatalogueRoot || rel == RunRoot || rel == BackupRoot {
+		return PoolObject{Kind: PoolObjectContainer}
+	}
+	if rel == "imports" {
+		return PoolObject{Kind: PoolObjectLegacyImports}
+	}
+	parts := strings.Split(rel, "/")
+	switch parts[0] {
+	case CatalogueRoot:
+		return classifyCatalogueChild(parts)
+	case RunRoot:
+		if len(parts) == 2 {
+			carrier := Classify(parts[1])
+			if carrier.Kind != CarrierEntity && carrier.Kind != CarrierSuperseded {
+				return PoolObject{Kind: PoolObjectCarrier, Name: parts[1], Carrier: carrier}
+			}
+			return PoolObject{Kind: PoolObjectUnknown, Name: parts[1]}
+		}
+		return PoolObject{Kind: PoolObjectUnknown}
+	case BackupRoot:
+		return classifyBackupChild(rel, parts)
+	}
+	if kind, ok := AsideKind(parts[0]); ok {
+		switch {
+		case len(parts) == 2:
+			return PoolObject{Kind: PoolObjectAsideChild, Root: parts[0], Name: parts[1]}
+		case len(parts) > 2:
+			return PoolObject{Kind: PoolObjectUnknown}
+		}
+		return PoolObject{Kind: asideObjectKind(kind), Root: parts[0]}
+	}
+	return PoolObject{Kind: PoolObjectUnknown, Name: lastPart(parts)}
+}
+
+func classifyCatalogueChild(parts []string) PoolObject {
+	if len(parts) != 2 {
+		return PoolObject{Kind: PoolObjectUnknown}
+	}
+	name := parts[1]
+	switch {
+	case ReservedCatalogueChild(name):
+		return PoolObject{Kind: PoolObjectReserved, Name: name}
+	case IsRecvTemp(name):
+		return PoolObject{Kind: PoolObjectRecvTemp, Name: name}
+	case Classify(name).Kind == CarrierSuperseded:
+		return PoolObject{Kind: PoolObjectSuperseded, Name: name}
+	}
+	return PoolObject{Kind: PoolObjectCatalogue, Name: name}
+}
+
+func classifyBackupChild(rel string, parts []string) PoolObject {
+	if rel == BackupRoot+"/"+CatalogueRoot {
+		return PoolObject{Kind: PoolObjectBackupCopy}
+	}
+	if len(parts) == 3 && parts[1] == CatalogueRoot {
+		return PoolObject{Kind: PoolObjectBackupItem, Name: parts[2]}
+	}
+	if kind, ok := AsideKind(parts[1]); ok && kind == PreservedRebuilding {
+		root := parts[0] + "/" + parts[1]
+		switch len(parts) {
+		case 2:
+			return PoolObject{Kind: PoolObjectBackupAside, Root: root}
+		case 3:
+			return PoolObject{Kind: PoolObjectAsideChild, Root: root, Name: parts[2]}
+		}
+	}
+	return PoolObject{Kind: PoolObjectUnknown}
+}
+
+func asideObjectKind(kind string) PoolObjectKind {
+	switch kind {
+	case PreservedRebuilding:
+		return PoolObjectRebuilding
+	case PreservedDiverged:
+		return PoolObjectDiverged
+	}
+	return PoolObjectHeld
+}
+
+func lastPart(parts []string) string {
+	if len(parts) == 1 {
+		return ""
+	}
+	return parts[len(parts)-1]
 }
 
 // DatasetID 取池路径的末段："tank/img_default" -> "img_default"。

@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// Explicit historical objects may be reclaimed; unknown derived images and their required sources remain.
+// 重建副本里明确删除的对象才回收；分叉副本整份不动，未知的派生镜像及其依赖的来源保留。
 func TestDeleteAsideImagePreservesUnlistedObjectsAndTheirBaselines(t *testing.T) {
 	z := newFakePool()
 	d, r := "tank/nd-diverged-1", "tank/nd-rebuilding-2"
@@ -27,15 +27,9 @@ func TestDeleteAsideImagePreservesUnlistedObjectsAndTheirBaselines(t *testing.T)
 
 	_ = a.DeleteAsideImage(context.Background(), "win10", []string{"win10_default"})
 	r = "tank/nd-diverged-2"
-	for _, kept := range []string{d, d + "/win10", d + "/win10_fork", r, r + "/win10", r + "/win10_default", r + "/saved"} {
+	for _, kept := range []string{d, d + "/win10", d + "/win10_default", d + "/win10_fork", "tank/run/IDENT-000000000001", r, r + "/win10", r + "/win10_default", r + "/saved"} {
 		if !z.present(kept) {
 			t.Fatalf("%s must remain: %v", kept, z.destroyed)
 		}
 	}
-	for _, gone := range []string{d + "/win10_default", "tank/run/IDENT-000000000001"} {
-		if z.present(gone) {
-			t.Fatalf("explicit historical object remains: %s", gone)
-		}
-	}
-
 }

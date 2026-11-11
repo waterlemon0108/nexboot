@@ -102,6 +102,7 @@ export const api = {
   exportImage: (id) => request(`/api/images/${encodeURIComponent(id)}/export`, { method: 'POST' }),
   exportReduction: (id) => request(`/api/reductions/${encodeURIComponent(id)}/export`, { method: 'POST' }),
   deleteImage: (id) => request(`/api/images/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  deleteImportFile: (name) => request(`/api/volumes/imports/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   // 从本机上传镜像：分片 + 断点续传，几十 G 的文件不能一次 POST。
   beginUpload: (body) => request('/api/images/uploads', { method: 'POST', body }),
   uploadStatus: (id) => request(`/api/images/uploads/${encodeURIComponent(id)}`),
@@ -148,6 +149,8 @@ export const api = {
   forgetClusterNode: (node) =>
     request(`/api/cluster/nodes/${encodeURIComponent(node)}`, { method: 'DELETE' }),
   listClusterPools: () => request('/api/cluster/pools'),
+  // 集群里几台的池可能同名，所以按节点和池名取；node 为空表示本机。
+  listVolumes: (node, pool) => request(`/api/volumes?${new URLSearchParams(node ? { node, pool } : { pool })}`),
   clusterServiceAction: (node, key, action) =>
     request(`/api/cluster/nodes/${encodeURIComponent(node)}/services/${encodeURIComponent(key)}/action`,
       { method: 'POST', body: { action } }),

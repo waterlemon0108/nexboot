@@ -257,8 +257,15 @@ func pinnedBy(origin string, gone []string) bool {
 }
 
 var identitySourcePart = regexp.MustCompile(`^[A-Za-z0-9_.:-]+$`)
-var rebuildingRoot = regexp.MustCompile(`^nd-rebuilding-[0-9]+$`)
-var divergedRoot = regexp.MustCompile(`^nd-diverged-[0-9]+$`)
+
+// identitySourceRoot 判断完整路径是否落在目录或挪开的副本里；分叉副本的根不算，它不是单个卷。
+func identitySourceRoot(parts []string) bool {
+	if parts[1] == storage.CatalogueRoot {
+		return len(parts) > 2
+	}
+	kind, ok := storage.AsideKind(parts[1])
+	return ok && (kind != storage.PreservedDiverged || len(parts) > 2)
+}
 
 // Sources may be relative catalogue entities or full local paths; never accept a pool/run root or traversal.
 func (a *Agent) identitySources(sources []string) ([]string, error) {
@@ -279,7 +286,7 @@ func (a *Agent) identitySources(sources []string) ([]string, error) {
 				return nil, fmt.Errorf("身份层清理来源不是配置或还原点：%s", source)
 			}
 			dataset = a.zfs.Dataset(dataset)
-		} else if parts[0] != a.zfs.PoolName() || !(parts[1] == storage.CatalogueRoot && len(parts) > 2 || rebuildingRoot.MatchString(parts[1]) || divergedRoot.MatchString(parts[1]) && len(parts) > 2) {
+		} else if parts[0] != a.zfs.PoolName() || !identitySourceRoot(parts) {
 			return nil, fmt.Errorf("身份层清理来源不在本节点目录或指定旧副本中：%s", source)
 		}
 		if hasSnap {

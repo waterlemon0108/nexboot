@@ -9,11 +9,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tianwei/diskless/internal/domain"
@@ -109,6 +109,8 @@ type Replicator struct {
 	markMu sync.Mutex
 	// holdUntil 让周期循环在计划切换排空期间暂停打标记；带时限，切换没完成也不会永久停掉复制。
 	holdUntil time.Time
+	// rotateRounds 是还要强制打的轮数，见 RotateMarkers。不用 markMu：删除请求不该等正在打的一轮。
+	rotateRounds atomic.Int32
 	// pulling 保证同时只有一次拉取（周期拉取与接任前追平写同一份目录），
 	// 也保护 PullFrom 临时替换的 Peer/PeerURL。用 channel 而非 mutex，等待才能放弃。
 	pulling     chan struct{}
@@ -169,6 +171,10 @@ func (r *Replicator) MarkOnce(ctx context.Context) (bool, error) {
 		return false, nil // 计划切换正在排空
 	}
 	name, err := r.mark(ctx, false)
+	// 写入者不拉取，当备机时留下的暂存只能在这里回收。
+	if r.Gate == nil || r.Gate.Allow() == nil {
+		r.pruneHeldCopies(ctx)
+	}
 	return name != "", err
 }
 
@@ -188,6 +194,12 @@ func (r *Replicator) ResumeMarking() {
 	r.holdUntil = time.Time{}
 }
 
+// RotateMarkers 让接下来几轮没有变化也打标记。删掉的文件还被旧标记占着，而文件不进指纹，
+// 集群空闲时标记不前进，空间就一直回不来。留 N 个标记时第 N 轮才挤掉删除之前的全部，多一轮给确认慢的备机。
+func (r *Replicator) RotateMarkers() {
+	r.rotateRounds.Store(replicationMarkersKept + 1)
+}
+
 // mark 打一轮并返回标记；无变化且非 force 时返回 ""。调用方须持有 markMu。
 func (r *Replicator) mark(ctx context.Context, force bool) (string, error) {
 	// force 来自正在退位的写入者（计划切换或交接），它的闸门可能已关，仍须打出最后一轮。
@@ -201,7 +213,8 @@ func (r *Replicator) mark(ctx context.Context, force bool) (string, error) {
 	// 指纹必须含数据库：分组、客户机、用户、设置只在 SQLite 里，只看数据集的话这些改动
 	// 要等下次导入镜像才会复制出去，故障切换会把它们回滚。
 	fingerprint := catalogueFingerprint(r.Root, inv) + "|db:" + r.dbFingerprint()
-	if fingerprint == r.lastFingerprint && !force {
+	rotating := r.rotateRounds.Load() > 0
+	if fingerprint == r.lastFingerprint && !force && !rotating {
 		return "", nil
 	}
 	dbDir, err := r.ZFS.EnsureDBCopyDataset(ctx)
@@ -235,6 +248,9 @@ func (r *Replicator) mark(ctx context.Context, force bool) (string, error) {
 		r.logf("有旧的复制标记这轮没删掉，下一轮再试", "error", err)
 	}
 	r.lastFingerprint = fingerprint
+	if rotating {
+		r.rotateRounds.Add(-1)
+	}
 	return name, nil
 }
 
@@ -251,6 +267,10 @@ func (r *Replicator) pinnedMarkers(ctx context.Context) []string {
 	cutoff := r.Now().Add(-markerPinWindow)
 	var out []string
 	for _, row := range rows {
+		// 指向本机的行是这台当备机时上一任记下的，留着只会多钉住一个切换前的标记。
+		if r.SelfURL != "" && row.Target == r.SelfURL {
+			continue
+		}
 		if row.Kind == "primary-serve" && row.LastSnapshot != "" && row.LastOKAt != nil && row.LastOKAt.After(cutoff) {
 			out = append(out, row.LastSnapshot)
 		}
@@ -554,9 +574,6 @@ func (r *Replicator) rebuildAfterCatchUp(ctx context.Context, cerr error, target
 	return rollbackDivergence(diverged.own, aside), nil
 }
 
-// recvTempName 是 libzfs 接收 -R 流时给同名冲突数据集起的临时名（recv-<pid>-<seq>）。
-var recvTempName = regexp.MustCompile(`^recv-\d+-\d+$`)
-
 // dropStaleRecvTemps 删掉被打断的接收留下的临时数据集，返回是否删过。它会挂在别的数据集的挂载点上，
 // 让之后每轮增量和重建改名都报 busy。拉取是单飞的，轮开始时还在的只能是残留；写入者有同名数据集的不动。
 func (r *Replicator) dropStaleRecvTemps(ctx context.Context, peerInv ha.ReplicationInventory, local zfs.GUIDInventory) bool {
@@ -566,7 +583,7 @@ func (r *Replicator) dropStaleRecvTemps(ctx context.Context, peerInv ha.Replicat
 	}
 	dropped := false
 	for _, e := range local.Entries {
-		if strings.Contains(e.Name, "@") || !recvTempName.MatchString(filepath.Base(e.Name)) ||
+		if strings.Contains(e.Name, "@") || !storage.IsRecvTemp(filepath.Base(e.Name)) ||
 			peerHas[strings.TrimPrefix(e.Name, r.Root)] {
 			continue
 		}
@@ -785,6 +802,8 @@ func (r *Replicator) releaseIdentityLayers(ctx context.Context, gone []string) e
 // 而写入者会把它持有的空目录复制出去。
 func (r *Replicator) rebuildPreserving(ctx context.Context, target string) error {
 	aside := fmt.Sprintf("%s-rebuilding-%d", r.Root, r.Now().UTC().UnixNano())
+	// 接收可能持续很久，写入者的删镜像会来清旧副本；这一份接收失败要改回原名，不能被动。
+	defer storage.MarkAsideInUse(aside)()
 	if err := r.ZFS.Rename(ctx, r.Root, aside); err != nil {
 		return err
 	}
@@ -1139,6 +1158,23 @@ func (r *Replicator) Status(ctx context.Context) (ReplicationStatus, error) {
 		out.Targets = append(out.Targets, tg)
 	}
 	return out, nil
+}
+
+// PullError 返回本节点最近一次拉取复制的错误；写入者不拉取，它的 standby-pull 行是当备机时留下的。
+func (r *Replicator) PullError(ctx context.Context) string {
+	if r.Gate != nil && r.Gate.Allow() == nil {
+		return ""
+	}
+	rows, err := r.Store.ReplicationStates().List(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, row := range rows {
+		if row.Kind == "standby-pull" && row.LastError != "" {
+			return row.LastError
+		}
+	}
+	return ""
 }
 
 // CaughtUpTo 判断已拉到 got 的备机是否至少到达 target 这一轮。

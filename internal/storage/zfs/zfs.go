@@ -764,6 +764,74 @@ func (c *Client) SpaceUsage(ctx context.Context) (SpaceUsage, error) {
 	return usage, nil
 }
 
+// ListPoolFacts 用一条命令读出池里的全部数据集和快照。只在操作者打开页面时调用：
+// 快照堆积时频繁跑 zfs list 曾拖垮过集群。
+func (c *Client) ListPoolFacts(ctx context.Context, pool string) (storage.PoolFacts, error) {
+	args := []string{"list", "-Hp", "-r", "-t", "filesystem,volume,snapshot",
+		"-o", "name,type,guid,used,referenced,usedbysnapshots,volsize,origin,creation,clones,available", pool}
+	out, err := c.runner.Run(ctx, "zfs", args...)
+	if err != nil {
+		return storage.PoolFacts{}, storage.CommandError{Name: "zfs", Args: args, Output: string(out), Err: err}
+	}
+	relative := func(name string) string {
+		if name == pool {
+			return ""
+		}
+		return strings.TrimPrefix(name, pool+"/")
+	}
+	facts := storage.PoolFacts{Pool: pool}
+	snaps := map[string][]storage.PoolSnapshotFact{}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Split(line, "\t")
+		if len(f) != 11 {
+			continue
+		}
+		name, kind := f[0], f[1]
+		if parent, snap, ok := strings.Cut(name, "@"); ok {
+			fact := storage.PoolSnapshotFact{Name: snap, GUID: f[2], Used: propInt(f[3]), Created: propInt(f[8])}
+			if f[9] != "-" {
+				for _, clone := range strings.Split(f[9], ",") {
+					fact.Clones = append(fact.Clones, relative(clone))
+				}
+			}
+			snaps[relative(parent)] = append(snaps[relative(parent)], fact)
+			continue
+		}
+		d := storage.PoolDatasetFact{Name: relative(name), Type: kind, GUID: f[2], Used: propInt(f[3]), Referenced: propInt(f[4]),
+			UsedBySnapshots: propInt(f[5]), VolSize: propInt(f[6]), Created: propInt(f[8])}
+		if f[7] != "-" {
+			d.Origin = relative(f[7])
+		}
+		if name == pool {
+			facts.Used, facts.Available = d.Used, propInt(f[10])
+		}
+		facts.Datasets = append(facts.Datasets, d)
+	}
+	for i := range facts.Datasets {
+		facts.Datasets[i].Snapshots = snaps[facts.Datasets[i].Name]
+	}
+	facts.Freeing = c.poolFreeing(ctx, pool)
+	return facts, nil
+}
+
+// poolFreeing 读后台还在释放的字节数。读不到只是少一个进度数字。
+func (c *Client) poolFreeing(ctx context.Context, pool string) int64 {
+	out, err := c.runner.Run(ctx, "zpool", "get", "-Hp", "-o", "value", "freeing", pool)
+	if err != nil {
+		return 0
+	}
+	return propInt(strings.TrimSpace(string(out)))
+}
+
+// propInt 解析 zfs 的数值属性；不适用时 zfs 输出 "-"，按 0 算。
+func propInt(v string) int64 {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // VolumeSize 读 zvol 的 volsize。
 func (c *Client) VolumeSize(ctx context.Context, dataset string) (int64, error) {
 	args := []string{"get", "-Hp", "-o", "value", "volsize", dataset}

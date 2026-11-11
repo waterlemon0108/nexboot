@@ -51,3 +51,17 @@ func HoldAsideCopies(ctx context.Context) (release func(), err error) {
 	}
 	return asideCopies.Unlock, nil
 }
+
+var asidesInUse sync.Map
+
+// MarkAsideInUse 标记一份挪开的副本正被重建当作退路：接收失败要改回原名，期间不能删子卷或改名。
+func MarkAsideInUse(dataset string) (done func()) {
+	asidesInUse.Store(dataset, struct{}{})
+	return func() { asidesInUse.Delete(dataset) }
+}
+
+// AsideInUse 判断这份挪开的副本是否正被重建当作退路。
+func AsideInUse(dataset string) bool {
+	_, ok := asidesInUse.Load(dataset)
+	return ok
+}

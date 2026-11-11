@@ -7,6 +7,7 @@ import { Field, Select, TableState, StatCard, SegFilter } from '../primitives.js
 import { api } from '../../lib/api.js';
 import { useResource, useMutation } from '../../lib/hooks.js';
 import { fmtCap } from '../../lib/format.js';
+import { PoolVolumes } from './storage-volumes.jsx';
 const { useState, useEffect } = React;
 
 const ROLE_LABEL = { data: "存储盘", read_cache: "读缓存", write_cache: "写缓存", special: "元数据盘", spare: "热备盘" };
@@ -133,6 +134,7 @@ function poolWriter(node) {
 function PageStorage() {
   const store = useStore();
   const conf = useConfirm();
+  const [tab, setTab] = useState("pools"); // pools | detail
   const [selectedId, setSelectedId] = useState(null);
   const [filterHealth, setFilterHealth] = useState("all");
   const [filterRole, setFilterRole] = useState("all");
@@ -266,6 +268,7 @@ function PageStorage() {
     if (!ok) return;
     if (await run(() => poolWriter(node).deletePool(pool.ID), `存储池 ${pool.Name} 销毁任务已提交`, { reload: load, errMsg: "销毁失败" })) {
       setSelectedId(null);
+      setTab("pools");
     }
   };
 
@@ -292,8 +295,37 @@ function PageStorage() {
   const onDetailChanged = () => { if (detailNode) reloadDetailDisks(); return load(); };
   const createFreeDisks = createDisks.filter(d => !d.InUse);
 
+  const openPool = (p) => { setSelectedId(p.ID); setTab("detail"); };
+  const tabKey = (next) => (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setTab(next); } };
+
   return (
     <div className="fade-in" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div className="tabs" style={{ marginBottom: 0 }}>
+        <div role="button" tabIndex={0} className={`tab ${tab === "pools" ? "active" : ""}`} onClick={() => setTab("pools")} onKeyDown={tabKey("pools")}>
+          存储池<span className="count">{pools.length}</span>
+        </div>
+        <div role="button" tabIndex={0} className={`tab ${tab === "detail" ? "active" : ""}`} onClick={() => setTab("detail")} onKeyDown={tabKey("detail")}>存储池详情</div>
+      </div>
+
+      {tab === "detail" && !selected && (
+        <div className="card" style={{ padding: 36, textAlign: "center", fontSize: 13, color: "var(--fg-mute)" }}>
+          请先在「存储池」列表里点一个池
+          <button className="btn ghost" style={{ marginLeft: 8, padding: "3px 8px" }} onClick={() => setTab("pools")}>去选择</button>
+        </div>
+      )}
+
+      {tab === "detail" && selected && (
+        <PoolVolumes key={selected.ID} pool={selected} node={selected.__node?.node_id || ""}
+          nodes={clustered ? (cluster?.nodes || []) : []}
+          serverLabel={clustered ? nodeLabel(selected.ServerID) : (selected.ServerID || "—")}
+          missing={isMissing(selected)}
+          roleChip={POOL_ROLE[selected.Role] ? <span className={`chip ${POOL_ROLE[selected.Role].cls}`}>{POOL_ROLE[selected.Role].text}</span> : <span className="chip">未指定</span>}
+          statusChip={String(selected.Health).toUpperCase() !== "ONLINE" ? <span className={`chip ${healthMeta(selected.Health).cls}`}>{healthMeta(selected.Health).text}</span> : null}
+          disksPanel={<PoolDisks pool={selected} freeDisks={freeDisks} onChanged={onDetailChanged}
+            onDestroy={() => doDestroy(selected)} remoteNode={detailNode}/>}/>
+      )}
+
+      {tab === "pools" && <>
       {/* 汇总统计，全部由池数据算出 */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12 }}>
         <StatCard label="存储池" value={pools.length} unit="个" accent="cyan"
@@ -343,7 +375,7 @@ function PageStorage() {
               const pct = cap ? Math.round(used / cap * 100) : 0;
               const hm = healthMeta(p.Health);
               return (
-                <tr key={p.ID} style={{ cursor: "pointer" }} onClick={() => setSelectedId(p.ID)}>
+                <tr key={p.ID} style={{ cursor: "pointer" }} onClick={() => openPool(p)}>
                   <td><div className="row"><Icons.Database size={14} style={{ color: "var(--cyan)" }}/><span className="mono" style={{ fontWeight: 600 }}>{p.Name}</span>{(() => {
                     const role = POOL_ROLE[p.Role];
                     return role
@@ -378,9 +410,7 @@ function PageStorage() {
         </table>
       </div>
 
-      {selected && <PoolDetail pool={selected} freeDisks={freeDisks} onClose={() => setSelectedId(null)} onChanged={onDetailChanged}
-        onDestroy={() => doDestroy(selected)} remoteNode={detailNode} remoteLabel={nodeLabel(detailNode)}
-        serverLabel={clustered ? nodeLabel(selected.ServerID) : (selected.ServerID || "—")}/>}
+      </>}
 
       <Modal open={modal === "create"} onClose={() => !busy && setModal(null)} title="创建存储池" size="md"
         footer={<><button className="btn" disabled={busy} onClick={() => setModal(null)}>取消</button>
@@ -478,8 +508,8 @@ function DiskPickModal({ open, title, freeDisks, busy, onClose, onConfirm, valid
   );
 }
 
-// 详情用居中弹窗，与产品里其它详情视图一致。
-function PoolDetail({ pool, freeDisks, onClose, onChanged, onDestroy, remoteNode = null, remoteLabel = "", serverLabel = "" }) {
+// 存储池详情的「磁盘与缓存」：成员磁盘、元数据盘、热备盘和读写缓存。
+function PoolDisks({ pool, freeDisks, onChanged, onDestroy, remoteNode = null }) {
   // 这一屏的写操作都发往池所在的节点。
   const api = poolWriter(remoteNode);
   const store = useStore();
@@ -489,8 +519,6 @@ function PoolDetail({ pool, freeDisks, onClose, onChanged, onDestroy, remoteNode
   const { busy, run: runMut } = useMutation(store.toast);
   const run = (fn, okMsg) => runMut(fn, okMsg, { reload: onChanged });
 
-  const cap = Number(pool.Capacity || 0), used = Number(pool.Used || 0);
-  const usePct = cap ? Math.round(used / cap * 100) : 0;
   const hm = healthMeta(pool.Health);
   const missing = isMissing(pool);
   const dataDisks = disksByRole(pool, "data", "Disks");
@@ -603,17 +631,9 @@ function PoolDetail({ pool, freeDisks, onClose, onChanged, onDestroy, remoteNode
   const flushWrite = async () => run(() => api.flushWriteCache(pool.ID), "写缓存刷新任务已提交");
 
   return (
-    <Modal open onClose={onClose} size="xl"
-      title={<span className="row" style={{ gap: 8 }}>
-        <Icons.Database size={15} style={{ color: "var(--cyan)" }}/>
-        存储池详情 · <span className="mono">{pool.Name}</span>
-      </span>}
-      /* 底部只放操作按钮、靠右，与客户机和镜像详情一致；关闭用标题栏的 ×。 */
-      footer={<button className="btn danger" disabled={busy} onClick={onDestroy}><Icons.Trash size={12}/> {missing ? "删除记录" : "销毁存储池"}</button>}>
+    <div className="card" style={{ padding: 18 }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           <KVGrid items={[
-            ["池名", pool.Name, true],
-            ["服务器", serverLabel || pool.ServerID || "—", true],
             ["布局", layoutLabel(pool), false],
             // 正在进行的重建或迁移跟在状态后面显示；没有就不占一格。
             ["状态", <span className="row" style={{ gap: 6 }}><span className={`chip ${hm.cls}`}>{hm.dot && <span className={`dot ${hm.dot}`}/>}{hm.text}</span>{pool.Operation && <span className="mono meta">{OP_LABEL[pool.Operation] || pool.Operation} {pool.Progress}</span>}</span>, false],
@@ -622,14 +642,6 @@ function PoolDetail({ pool, freeDisks, onClose, onChanged, onDestroy, remoteNode
           {missing ? <div className="hint">
             本机上已找不到该池，这里只剩它的记录{(pool.Disks || []).length ? `（原成员 ${pool.Disks.join("、")}）` : ""}。删除这条记录不会改动任何磁盘，删除后可在该服务器上重新创建同名的池。
           </div> : <>
-          <Section title="容量">
-            <div className="row" style={{ gap: 12, marginBottom: 8 }}>
-              <span className="mono" style={{ fontSize: 18, fontWeight: 600 }}>{fmtCap(used)}</span>
-              <span className="mono" style={{ color: "var(--fg-faint)", fontSize: 13 }}>/ 共 {fmtCap(cap)} · 可用 {fmtCap(cap - used)} · 已使用 {usePct}%</span>
-            </div>
-            <div className={`bar ${usePct > 85 ? "rose" : usePct > 70 ? "amber" : ""}`}><span style={{ width: `${usePct}%` }}/></div>
-          </Section>
-
           <DiskSection title="成员磁盘" disks={dataDisks} groups={dataGroups} busy={busy}
             onAdd={() => setPicker("data")} onRemove={removeDataDisk}
             removable={!parity && dataDisks.length > 1}
@@ -670,6 +682,7 @@ function PoolDetail({ pool, freeDisks, onClose, onChanged, onDestroy, remoteNode
             note="只加速同步写，无盘客户机的日常写入用不上，一般不需要；确需时用带断电保护的企业级 SSD 并镜像"
             extraAction={writeCache.length ? <button className="btn" disabled={busy} style={{ padding: "3px 10px" }} onClick={flushWrite}><Icons.Refresh size={11}/> 刷新写缓存</button> : null}/>
           </>}
+          <div><button className="btn danger" disabled={busy} onClick={onDestroy}><Icons.Trash size={12}/> {missing ? "删除记录" : "销毁存储池"}</button></div>
         </div>
 
         {/* 条带升级为 RAID1：每块数据盘配一块空闲盘，一个任务完成。在线进行，ZFS 只在后台复制已用块。 */}
@@ -707,7 +720,7 @@ function PoolDetail({ pool, freeDisks, onClose, onChanged, onDestroy, remoteNode
           validate={attaching ? validateAttach : expanding ? validateRaidzExpand : replacing ? validateReplace : picker === "data" ? validateExpand : picker === "special" ? validateSpecial : null}
           onClose={() => setPicker(null)} onConfirm={addFor}/>
         {conf.node}
-    </Modal>
+    </div>
   );
 }
 

@@ -757,12 +757,26 @@ describe('还原点页', () => {
     await waitFor(() => expect(applyReduction).toHaveBeenCalledWith('win11_default_office'));
   });
 
+  it('另存和导出收在「更多」里，行上只留应用和详情', async () => {
+    renderPage();
+    await openTab('还原点');
+    const row = (await screen.findByRole('button', { name: '更多操作 装完office' })).closest('tr');
+    expect(within(row).queryByRole('button', { name: /另存为新镜像/ })).toBeNull();
+    expect(within(row).queryByRole('button', { name: /导出为镜像文件/ })).toBeNull();
+    expect(within(row).getByRole('button', { name: '详情' })).toBeTruthy();
+    await userEvent.click(within(row).getByRole('button', { name: '更多操作 装完office' }));
+    for (const name of ['另存为新镜像', '导出为镜像文件', '覆盖原镜像', '删除']) {
+      expect(screen.getByRole('button', { name })).toBeTruthy();
+    }
+  });
+
   it('另存为新镜像：填名字后提交', async () => {
     const saveReductionAsImage = vi.fn(async () => ({ task_id: 'task-copy' }));
     stubApi({ saveReductionAsImage });
     renderPage();
     await openTab('还原点');
-    await userEvent.click(await screen.findByRole('button', { name: '另存为新镜像 装完office' }));
+    await userEvent.click(await screen.findByRole('button', { name: '更多操作 装完office' }));
+    await userEvent.click(await screen.findByRole('button', { name: '另存为新镜像' }));
     const name = await screen.findByLabelText('新镜像名称');
     await userEvent.clear(name);
     await userEvent.type(name, '办公版');
@@ -777,7 +791,8 @@ describe('还原点页', () => {
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
     renderPage();
     await openTab('还原点');
-    await userEvent.click(await screen.findByRole('button', { name: '导出为镜像文件 装完office' }));
+    await userEvent.click(await screen.findByRole('button', { name: '更多操作 装完office' }));
+    await userEvent.click(await screen.findByRole('button', { name: '导出为镜像文件' }));
     expect(await screen.findByText(/导出内容为该还原点的完整磁盘数据/)).toBeTruthy();
     await userEvent.click(screen.getByLabelText('gzip 压缩'));
     await userEvent.click(screen.getByRole('button', { name: /下载到本地/ }));
@@ -789,7 +804,8 @@ describe('还原点页', () => {
     stubApi({ exportReduction });
     renderPage();
     await openTab('还原点');
-    await userEvent.click(await screen.findByRole('button', { name: '导出为镜像文件 装完office' }));
+    await userEvent.click(await screen.findByRole('button', { name: '更多操作 装完office' }));
+    await userEvent.click(await screen.findByRole('button', { name: '导出为镜像文件' }));
     await userEvent.click(await screen.findByRole('button', { name: /导出到服务器目录/ }));
     await waitFor(() => expect(exportReduction).toHaveBeenCalledWith('win11_default_office'));
     expect(await screen.findByText(/目标文件：192\.168\.10\.3 上的/)).toBeTruthy();

@@ -52,6 +52,8 @@ type fakePool struct {
 	snapOrder []string
 	// beforeOp 在下一个修改操作前执行一次，用于模拟两个请求交错。
 	beforeOp func(op string)
+	// poolFacts 是 ListPoolFacts 按池名的应答。
+	poolFacts map[string]storage.PoolFacts
 }
 
 func newFakePool() *fakePool {
@@ -457,6 +459,14 @@ func (p *fakePool) EnsureDBCopyDataset(context.Context) (string, error) {
 
 func (p *fakePool) EnsureFilesDataset(context.Context) (string, error) {
 	return "/tank/nd/files", nil
+}
+
+func (p *fakePool) ListPoolFacts(_ context.Context, pool string) (storage.PoolFacts, error) {
+	facts, ok := p.poolFacts[pool]
+	if !ok {
+		return storage.PoolFacts{}, fmt.Errorf("cannot open '%s': dataset does not exist", pool)
+	}
+	return facts, nil
 }
 
 func (p *fakePool) ListPoolNames(_ context.Context) ([]string, error) {

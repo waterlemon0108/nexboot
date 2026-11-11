@@ -24,24 +24,20 @@ func TestDeleteAsideImageNeverTreatsAnotherImageCloneAsAConfig(t *testing.T) {
 }
 
 func TestDeleteAsideImageDeletesExplicitHistoricalObjectsButKeepsSharedHeads(t *testing.T) {
-	for _, kind := range []string{"diverged", "rebuilding"} {
-		t.Run(kind, func(t *testing.T) {
-			z := newFakePool()
-			root := "tank/nd-" + kind + "-123"
-			z.datasets = []string{root, root + "/db", root + "/files", root + "/image", root + "/image_default"}
-			z.snaps[root+"/image@unique-point"] = true
-			z.origin[root+"/image_default"] = root + "/image@unique-point"
-			a := New("node", z, &fakeExporter{})
-			if err := a.DeleteAsideImage(context.Background(), "image", []string{"image_default"}); err != nil {
-				t.Fatal(err)
-			}
-			if !z.present(root) || !z.present(root+"/db") || !z.present(root+"/files") {
-				t.Fatalf("unverified file/database heads destroyed: %v", z.destroyed)
-			}
-			if z.present(root+"/image") || z.present(root+"/image_default") {
-				t.Fatalf("explicitly deleted historical objects remain: %v", z.datasets)
-			}
-		})
+	z := newFakePool()
+	root := "tank/nd-rebuilding-123"
+	z.datasets = []string{root, root + "/db", root + "/files", root + "/image", root + "/image_default"}
+	z.snaps[root+"/image@unique-point"] = true
+	z.origin[root+"/image_default"] = root + "/image@unique-point"
+	a := New("node", z, &fakeExporter{})
+	if err := a.DeleteAsideImage(context.Background(), "image", []string{"image_default"}); err != nil {
+		t.Fatal(err)
+	}
+	if !z.present(root) || !z.present(root+"/db") || !z.present(root+"/files") {
+		t.Fatalf("unverified file/database heads destroyed: %v", z.destroyed)
+	}
+	if z.present(root+"/image") || z.present(root+"/image_default") {
+		t.Fatalf("explicitly deleted historical objects remain: %v", z.datasets)
 	}
 }
 
@@ -83,36 +79,30 @@ func TestDeleteAsideImageReclaimsOnlyExplicitRebuildingObjectsAndCanRetry(t *tes
 }
 
 func TestDeleteAsideImageRetainsDerivedImageAndOnlyItsRequiredBaselines(t *testing.T) {
-	for _, kind := range []string{"diverged", "rebuilding"} {
-		t.Run(kind, func(t *testing.T) {
-			z := newFakePool()
-			root := "tank/nd-" + kind + "-42"
-			z.datasets = []string{root, root + "/image", root + "/image_default", root + "/saved-image", root + "/other-config"}
-			z.origin[root+"/image_default"] = root + "/image@0"
-			z.origin[root+"/saved-image"] = root + "/image_default@new-image"
-			z.origin[root+"/other-config"] = root + "/image@0"
-			a := New("node", z, &fakeExporter{})
-			if err := a.DeleteAsideImage(context.Background(), "image", []string{"image_default", "other-config"}); err != nil {
-				t.Fatal(err)
-			}
-			if kind == "rebuilding" {
-				root = "tank/nd-diverged-42"
-			}
-			for _, kept := range []string{root + "/image", root + "/image_default", root + "/saved-image"} {
-				if !z.present(kept) {
-					t.Fatalf("derived image baseline lost: %s", kept)
-				}
-			}
-			if z.present(root + "/other-config") {
-				t.Fatal("unneeded explicitly deleted configuration retained")
-			}
-		})
+	z := newFakePool()
+	root := "tank/nd-rebuilding-42"
+	z.datasets = []string{root, root + "/image", root + "/image_default", root + "/saved-image", root + "/other-config"}
+	z.origin[root+"/image_default"] = root + "/image@0"
+	z.origin[root+"/saved-image"] = root + "/image_default@new-image"
+	z.origin[root+"/other-config"] = root + "/image@0"
+	a := New("node", z, &fakeExporter{})
+	if err := a.DeleteAsideImage(context.Background(), "image", []string{"image_default", "other-config"}); err != nil {
+		t.Fatal(err)
+	}
+	root = "tank/nd-diverged-42"
+	for _, kept := range []string{root + "/image", root + "/image_default", root + "/saved-image"} {
+		if !z.present(kept) {
+			t.Fatalf("derived image baseline lost: %s", kept)
+		}
+	}
+	if z.present(root + "/other-config") {
+		t.Fatal("unneeded explicitly deleted configuration retained")
 	}
 }
 
 func TestDeleteAsideImageRefusesLiveClientDependenciesRatherThanTreatingThemAsNewImages(t *testing.T) {
 	z := newFakePool()
-	root := "tank/nd-diverged-123"
+	root := "tank/nd-rebuilding-123"
 	client := "tank/run/CLIENT-001122334455"
 	z.datasets = []string{root, root + "/image", root + "/cfg", client}
 	z.origin[root+"/cfg"] = root + "/image@0"
@@ -185,5 +175,48 @@ func TestDeleteAsideImageUsesTheSameLockAsWholeTreePruning(t *testing.T) {
 	}
 	if len(z.destroyAttempts) > 0 {
 		t.Fatalf("mutated under automatic prune lock: %v", z.destroyAttempts)
+	}
+}
+
+// 分叉副本可能装着失联期间写下的内容，只能由操作者确认后删，删镜像不能顺带删掉。
+func TestDeleteAsideImageLeavesDivergedCopiesToTheOperator(t *testing.T) {
+	z := newFakePool()
+	root := "tank/nd-diverged-123"
+	layer := "tank/run/IDENT-000000000001"
+	z.datasets = []string{root, root + "/image", root + "/image_default", layer}
+	z.origin[root+"/image_default"] = root + "/image@0"
+	z.origin[layer] = root + "/image_default@1"
+	a := New("node", z, &fakeExporter{})
+	if err := a.DeleteAsideImage(context.Background(), "image", []string{"image_default"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, kept := range []string{root + "/image", root + "/image_default", layer} {
+		if !z.present(kept) {
+			t.Fatalf("分叉副本的内容被删镜像带走了：%s", kept)
+		}
+	}
+	if len(z.destroyAttempts) > 0 {
+		t.Fatalf("动了分叉副本：%v", z.destroyAttempts)
+	}
+}
+
+// 重建接收期间，挪开的旧副本是失败时改回原名的退路，不能被删子卷或改名。
+func TestDeleteAsideImageSkipsTheCopyARebuildMayRollBackTo(t *testing.T) {
+	z := newFakePool()
+	root := "tank/nd-rebuilding-42"
+	z.datasets = []string{root, root + "/image", root + "/image_default", root + "/saved"}
+	z.origin[root+"/image_default"] = root + "/image@0"
+	z.origin[root+"/saved"] = root + "/image_default@new"
+	done := storage.MarkAsideInUse(root)
+	defer done()
+	a := New("node", z, &fakeExporter{})
+	if err := a.DeleteAsideImage(context.Background(), "image", []string{"image_default"}); err != nil {
+		t.Fatal(err)
+	}
+	if !z.present(root+"/image") || !z.present(root+"/image_default") || !z.present(root+"/saved") {
+		t.Fatalf("重建的退路被动了：%v", z.datasets)
+	}
+	if len(z.destroyAttempts) > 0 || len(z.ops) > 0 {
+		t.Fatalf("重建的退路被动了：destroy=%v ops=%v", z.destroyAttempts, z.ops)
 	}
 }

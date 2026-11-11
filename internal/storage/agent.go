@@ -27,6 +27,15 @@ func (e SuperSessionMissing) Error() string {
 	return fmt.Sprintf("no super session to save for lun %d", e.LUN)
 }
 
+// NodeUnreachable 表示没有联系上对端节点（没收到任何应答），区别于对端收到请求后拒绝。
+type NodeUnreachable struct {
+	Node string
+	Err  error
+}
+
+func (e NodeUnreachable) Error() string { return fmt.Sprintf("storage node %s: %v", e.Node, e.Err) }
+func (e NodeUnreachable) Unwrap() error { return e.Err }
+
 // PreservedCopy 是节点挪到一边而非销毁的目录副本：-diverged- 含现行目录没有的内容，
 // -rebuilding- 是重建留下的旧副本。何时删除只能由操作者决定。
 type PreservedCopy struct {
@@ -41,6 +50,7 @@ type PreservedCopy struct {
 const (
 	PreservedDiverged   = "diverged"
 	PreservedRebuilding = "rebuilding"
+	PreservedHeld       = "held"
 )
 
 // PublishDataDiskReq 请求在超管机运行中把某块数据盘发布为还原点；LUN 0（系统盘）不可发布。
