@@ -408,6 +408,29 @@ func main() {
 		Now:   func() time.Time { return time.Now().UTC() },
 		Local: agent.PreservedCopies,
 	}
+	// 只在打开页面时读，同一个池 10 秒内不重复跑 zfs list。
+	poolFacts := &ops.PoolFactsCache{TTL: 10 * time.Second, Read: func(ctx context.Context, pool string) (storage.PoolFacts, error) {
+		facts, err := agent.PoolFacts(ctx, pool)
+		if err == nil {
+			facts.PullError = replicator.PullError(ctx)
+		}
+		return facts, err
+	}}
+	importFiles := assets.ImportFileService{
+		Store: st, ImportDir: settingsService.ImportDir,
+		AfterDelete: func(context.Context) {
+			poolFacts.Forget()
+			replicator.RotateMarkers()
+		},
+	}
+	volumeService := ops.PoolVolumeService{
+		Store: st, NodeID: cfg.NodeID, DataPool: agent.DataPoolName(), SelfURL: selfAPIURL(cfg),
+		Facts:  poolFacts.Get,
+		Writer: func() bool { return gate.Allow() == nil },
+		Fetch: func(ctx context.Context, apiURL, pool string) (storage.PoolFacts, error) {
+			return platform.FetchNodeVolumes(ctx, apiURL, cfg.ClusterToken, pool)
+		},
+	}
 	alarmService := platform.AlarmService{Store: st, Logger: logger, Rules: platform.DefaultAlarmRules(poolService, serverService, backupService, reconcileService, st, platform.AlarmThresholds{}, platform.NetworkAlarmInputs{
 		Client: func(ctx context.Context) (assets.ClientNetwork, error) { return networkService.Client(ctx) },
 		Reachable: func(ctx context.Context, ip string) bool {
@@ -1047,6 +1070,7 @@ func main() {
 		},
 		NodeBackup:     backupService.LocalStatus,
 		NodePreserved:  agent.PreservedCopies,
+		NodeVolumes:    poolFacts.Get,
 		NodeTasks:      func(ctx context.Context) ([]domain.Task, error) { return platform.NodePoolTasks(ctx, st) },
 		StorageHandler: remote.Handler{Agent: agent, Token: cfg.ClusterToken, NodeID: cfg.NodeID, CleanupInstallation: installationService.CleanupLocalInstallation},
 		HA: ha.StatusService{Controller: haController, NodeID: cfg.NodeID, PeerURL: cfg.PeerURL, Peer: haController.Peer,
@@ -1103,7 +1127,7 @@ func main() {
 				_ = st.ReplicationStates().Upsert(context.Background(), row)
 			}},
 		Replication: replicator,
-		Boot:        bootService, BootPeerCheckOff: envBool("NDISKLESS_BOOT_PEER_CHECK_OFF"), Auth: authService, Images: imageService, Uploads: uploadService, LegacyImports: legacyImports, Configs: configService, Reductions: reductionService, Groups: groupService, GroupDisks: groupDiskService, Terminals: terminalService, Pools: poolService, Users: userService, Backups: backupService, Consistency: reconcileService, Settings: settingsService, Network: networkService, Tasks: platform.ClusterTasks{Store: st, Local: imageService, NodeID: cfg.NodeID, Token: cfg.ClusterToken, LocalTaskLog: localTaskLog}, Drivers: driverService, WinPE: winpeService, PE: peSessions, Install: installationService, LocalTaskLog: localTaskLog, ModelAdapt: modelAdaptService, Identity: identityService, Models: api.ModelAPI{Service: *hardwareService}, Server: serverService, Audit: auditService, Alarms: alarmService, Runtime: api.RuntimeConfig{}})
+		Boot:        bootService, BootPeerCheckOff: envBool("NDISKLESS_BOOT_PEER_CHECK_OFF"), Auth: authService, Images: imageService, Uploads: uploadService, LegacyImports: legacyImports, Configs: configService, Reductions: reductionService, Groups: groupService, GroupDisks: groupDiskService, Terminals: terminalService, Pools: poolService, Volumes: volumeService, ImportFiles: importFiles, Users: userService, Backups: backupService, Consistency: reconcileService, Settings: settingsService, Network: networkService, Tasks: platform.ClusterTasks{Store: st, Local: imageService, NodeID: cfg.NodeID, Token: cfg.ClusterToken, LocalTaskLog: localTaskLog}, Drivers: driverService, WinPE: winpeService, PE: peSessions, Install: installationService, LocalTaskLog: localTaskLog, ModelAdapt: modelAdaptService, Identity: identityService, Models: api.ModelAPI{Service: *hardwareService}, Server: serverService, Audit: auditService, Alarms: alarmService, Runtime: api.RuntimeConfig{}})
 	server := &http.Server{
 		Addr:    cfg.Addr,
 		Handler: router,

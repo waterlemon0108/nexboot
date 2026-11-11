@@ -208,7 +208,7 @@ func (c Client) call(ctx context.Context, method string, in, dst any) error {
 	}
 	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
-		return fmt.Errorf("storage node %s: %w", c.BaseURL, err)
+		return storage.NodeUnreachable{Node: c.BaseURL, Err: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

@@ -12,6 +12,9 @@ ZFS 拒绝一个操作、LIO 导出一个 LUN、分区节点出现、镜像体�
 | `driver_matrix.py` | 机型页驱动包：上传、INF 解析、禁用与删除 |
 | `platform_matrix.py` | 用户增删改密与登录、告警从产生到确认到自动恢复、审计落库 |
 | `pool_matrix.py` | 存储池：建池、加盘、换盘、读写缓存增删、销毁与盘的回收 |
+| `volume_matrix.py` | 存储池详情：页面和 `zfs list` 逐项对账、各类别合计等于已用、读一次不改动池、10 秒缓存、读不到和拒绝的说法（只读，不留状态） |
+| `import_delete_matrix.py` | 删除导入文件：不该删的删不掉、页面马上更新、审计带文件名、备机跟着删、旧标记轮转后空间真的回来（只动自己上传的 64 MiB 文件） |
+| `delete_standby_down_matrix.py` | 一台备机停服时删镜像：刚停时拒绝并点名、什么都没动，另一台照常追平；心跳过期后能删，另一台跟着删；停掉的回来后增量追平，不触发整份重建（**破坏性**：停一台备机几分钟，需 ND_NODES、ND_CLUSTER_TOKEN） |
 | `backup_matrix.py` | 本地备份：整库一条流、DB 副本随流、合并/超管保存后增量自愈、基准丢失退全量（需 ND_BACKUP_POOL 与 ND_WINDOWS_SOURCE） |
 | `ha_matrix.py` | 双机热备：VIP 漂移计时、故障切换/回归/计划切换、隔离下激活门、双程数据存活（需 ND_NODE_A/B、ND_VIP、ND_CLUSTER_TOKEN） |
 | `cluster_matrix.py` | 三节点集群：节点注册、分组放置到存储节点、故障回退与恢复、quorum 激活门、清理路由（需 ND_NODE_A/B/C、ND_VIP、ND_CLUSTER_TOKEN） |

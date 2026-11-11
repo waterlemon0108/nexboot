@@ -1009,6 +1009,13 @@ func (s ImageService) DeleteImage(ctx context.Context, id string) error {
 	if err := clearNodeLayers(ctx, s.Place, layers); err != nil {
 		return err
 	}
+	// 必须在销毁之前：销毁后再失败会留下「池无库有」，随 Incomplete 下发后其他备机全部拒绝复制。
+	// 也不能放进下面的目录锁，RPC 可达 60 秒，期间复制打标记和其他目录变更都会被挡住。
+	if err := s.dropAsideImage(ctx, img, configIDs); err != nil {
+		return err
+	}
+	// 从这里起不能半途而废：取消会杀掉 zfs destroy，同样留下「池无库有」。
+	ctx = context.WithoutCancel(ctx)
 	// 下面的 destroy 与删行对复制而言是同一次变更。
 	defer storage.ChangeCatalogue()()
 	if err := s.Storage.DeleteImage(ctx, id, configIDs); err != nil {
@@ -1018,9 +1025,6 @@ func (s ImageService) DeleteImage(ctx context.Context, id string) error {
 			}
 			return errs.Conflict(fmt.Sprintf("镜像「%s」的数据正被占用，没有删掉：请稍等一两分钟再删", img.Name))
 		}
-		return err
-	}
-	if err := s.dropAsideImage(ctx, id, configIDs); err != nil {
 		return err
 	}
 	for _, cfg := range configs {
@@ -1040,9 +1044,15 @@ func (s ImageService) DeleteImage(ctx context.Context, id string) error {
 	return nil
 }
 
-// dropAsideImage must finish on every registered node before metadata is deleted, so failures remain retryable.
-func (s ImageService) dropAsideImage(ctx context.Context, imageID string, configIDs []string) error {
+// staleNodeWait 限定联系心跳已过期节点的时间：这类节点多半已离线，不能让删除请求等满 RPC 的 60 秒。
+const staleNodeWait = 10 * time.Second
+
+// dropAsideImage 让每台节点清掉旧副本里这个镜像的数据，在销毁之前调用，失败时什么都还没动。
+// 心跳已过期又联系不上的节点才跳过：一台长期离线的备机不能挡住删除，它的旧副本之后在存储池详情里处理。
+// 心跳过期但应答了拒绝的不算离线，照常拦下。
+func (s ImageService) dropAsideImage(ctx context.Context, img domain.Image, configIDs []string) error {
 	hosts := []place.Placed{{Agent: s.Storage}}
+	addr := map[string]string{}
 	if s.Place != nil {
 		nodes, err := s.Store.Servers().List(ctx)
 		if err != nil {
@@ -1050,7 +1060,10 @@ func (s ImageService) dropAsideImage(ctx context.Context, imageID string, config
 		}
 		ids := []string{s.Place.NodeID}
 		for _, node := range nodes {
-			ids = append(ids, node.ID)
+			addr[node.ID] = node.IP
+			if node.APIURL != "" { // 没有地址的花名册行从来联系不上
+				ids = append(ids, node.ID)
+			}
 		}
 		hosts, err = s.Place.NamedHosts(ctx, ids)
 		if err != nil {
@@ -1060,11 +1073,34 @@ func (s ImageService) dropAsideImage(ctx context.Context, imageID string, config
 	for _, h := range hosts {
 		agent, ok := h.Agent.(storage.AsideHostAgent)
 		if !ok {
-			continue
-		} // Single-node/custom agents without preserved-copy support have no aside operation.
-		if err := agent.DeleteAsideImage(ctx, imageID, configIDs); err != nil {
-			return errs.Conflict(fmt.Sprintf("请确认节点 %s 可用后重试删除镜像 %s：旧副本尚未清理，镜像记录已保留（%s）", h.ServerID, imageID, zfs.OperatorMessage(err)))
+			continue // 单机或自定义 agent 没有旧副本可清
 		}
+		stale := h.Remote && !h.Healthy
+		call, cancel := ctx, context.CancelFunc(func() {})
+		if stale {
+			call, cancel = context.WithTimeout(ctx, staleNodeWait)
+		}
+		err := agent.DeleteAsideImage(call, img.ID, configIDs)
+		cancel()
+		if err == nil {
+			continue
+		}
+		var gone storage.NodeUnreachable
+		unreachable := errors.As(err, &gone)
+		if stale && unreachable {
+			slog.Warn("离线节点上的旧副本没有清理，等它回来后在存储池详情里处理", "node", h.ServerID, "image", img.ID, "error", err)
+			continue
+		}
+		who := addr[h.ServerID]
+		if who == "" {
+			who = h.ServerID
+		}
+		if unreachable {
+			slog.Warn("节点连不上，删除镜像被拒绝", "node", h.ServerID, "image", img.ID, "error", err)
+			return errs.Conflict(fmt.Sprintf("请先恢复节点 %s 再删除，镜像「%s」还没有动：这台现在连不上，它上面可能有这个镜像的旧副本。确定它短期回不来的话，等它离线满 %d 秒再删。",
+				who, img.Name, int(place.Freshness.Seconds())))
+		}
+		return errs.Conflict(fmt.Sprintf("请先处理节点 %s 后重试，镜像「%s」还没有动：%s", who, img.Name, zfs.OperatorMessage(err)))
 	}
 	return nil
 }

@@ -1375,3 +1375,68 @@ func TestWrittenSinceUsesTheSpecifiedSnapshotAndRejectsUnknownCounts(t *testing.
 		t.Fatalf("query failure lost: %v", err)
 	}
 }
+
+// 输出取自 .56 上真实的 zfs list：列之间是制表符，快照的 usedbysnapshots 和 available 是 "-"。
+const poolFactsSample = "tank\tfilesystem\t445750231266067403\t56045105152\t98304\t0\t-\t-\t1791475950\t-\t76092248064\n" +
+	"tank/nd\tfilesystem\t3509242829315844636\t55991087104\t98304\t0\t-\t-\t1791475950\t-\t76092248064\n" +
+	"tank/nd@rep-1793945325743146616\tsnapshot\t77\t0\t98304\t-\t-\t-\t1793945325\t-\t-\n" +
+	"tank/nd/iso\tvolume\t15766104189947415506\t7591452672\t7591452672\t0\t68719476736\t-\t1792385611\t-\t76092248064\n" +
+	"tank/nd/iso@0\tsnapshot\t12222193770763240081\t0\t7591452672\t-\t68719476736\t-\t1792387728\ttank/nd/iso_default\t-\n" +
+	"tank/nd/iso_default\tvolume\t2126834703581832570\t8192\t7591452672\t96296960\t68719476736\ttank/nd/iso@0\t1792387728\t-\t76092248064\n" +
+	"tank/nd/iso_default@2\tsnapshot\t8282887570735269369\t4096\t7591452672\t-\t68719476736\t-\t1792387728\ttank/run/IDENT-A,tank/run/IDENT-B\t-\n"
+
+func TestListPoolFactsParsesDatasetsAndSnapshots(t *testing.T) {
+	runner := &sequenceRunner{outs: [][]byte{[]byte(poolFactsSample), []byte("1024\n")}}
+	client := New("tank", runner, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	got, err := client.ListPoolFacts(context.Background(), "tank")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Pool != "tank" || got.Used != 56045105152 || got.Available != 76092248064 || got.Freeing != 1024 {
+		t.Fatalf("池的合计不对：%+v", got)
+	}
+	if len(got.Datasets) != 4 {
+		t.Fatalf("数据集数量不对：%+v", got.Datasets)
+	}
+	byName := map[string]storage.PoolDatasetFact{}
+	for _, d := range got.Datasets {
+		byName[d.Name] = d
+	}
+	root, ok := byName[""]
+	if !ok || root.Type != "filesystem" || root.Used != 56045105152 {
+		t.Fatalf("池根不对：%+v", root)
+	}
+	if m := byName["nd"].Snapshots; len(m) != 1 || m[0].Name != "rep-1793945325743146616" {
+		t.Fatalf("目录根的标记没有挂上：%+v", m)
+	}
+	cfg := byName["nd/iso_default"]
+	if cfg.Origin != "nd/iso@0" || cfg.VolSize != 68719476736 || cfg.UsedBySnapshots != 96296960 || cfg.Type != "volume" || cfg.Created != 1792387728 {
+		t.Fatalf("配置不对：%+v", cfg)
+	}
+	if len(cfg.Snapshots) != 1 {
+		t.Fatalf("配置的快照没挂上：%+v", cfg.Snapshots)
+	}
+	snap := cfg.Snapshots[0]
+	if snap.Name != "2" || snap.GUID != "8282887570735269369" || snap.Used != 4096 || !reflect.DeepEqual(snap.Clones, []string{"run/IDENT-A", "run/IDENT-B"}) {
+		t.Fatalf("快照不对：%+v", snap)
+	}
+}
+
+// 读不到 freeing 只少一个进度数字，不能让整页报错。
+func TestListPoolFactsToleratesAnUnreadableFreeing(t *testing.T) {
+	runner := &sequenceRunner{outs: [][]byte{[]byte(poolFactsSample), nil}, err: errors.New("boom"), errAt: 2}
+	client := New("tank", runner, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	got, err := client.ListPoolFacts(context.Background(), "tank")
+	if err != nil || got.Freeing != 0 || got.Used == 0 {
+		t.Fatalf("got %+v err=%v", got, err)
+	}
+}
+
+func TestListPoolFactsReportsAListFailure(t *testing.T) {
+	runner := &sequenceRunner{outs: [][]byte{[]byte("cannot open 'gone': dataset does not exist")}, err: errors.New("exit status 1")}
+	client := New("tank", runner, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := client.ListPoolFacts(context.Background(), "gone"); err == nil {
+		t.Fatal("读不到池时不能当成空池")
+	}
+}

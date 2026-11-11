@@ -57,6 +57,8 @@ type fakeReplZFS struct {
 	clonesOf map[string][]string
 	// held 是改名进 "-held-" 暂存名的数据集。
 	held []string
+	// onRecv 在开始收流时执行一次，用于观察接收期间的状态。
+	onRecv func()
 }
 
 func (f *fakeReplZFS) ListHeldCopies(_ context.Context, root string) ([]string, error) {
@@ -111,6 +113,9 @@ func (f *fakeReplZFS) PruneSnapshotsExcept(_ context.Context, root, prefix strin
 	return f.pruneErr
 }
 func (f *fakeReplZFS) ReceiveReplication(_ context.Context, root string, r io.Reader) error {
+	if f.onRecv != nil {
+		f.onRecv()
+	}
 	f.recvTargets = append(f.recvTargets, root)
 	b, _ := io.ReadAll(r)
 	f.received = append(f.received, string(b))
@@ -1092,6 +1097,63 @@ func (w *testWriter) Write(p []byte) (int, error) {
 
 // 空闲集群必须安静：目录没变就不打轮次。健康探针每 2 秒写入再回滚会弄脏 -wal，
 // 判据不能看文件戳，否则每轮都要白做整库导出、递归快照和推流。
+// 删掉的文件还被旧标记占着。文件不进指纹，空闲集群不打新标记，空间就一直回不来；
+// 要连打几轮，把删除之前的标记全部挤出去，然后恢复安静。
+func TestRotateMarkersPushesOutEveryMarkerOlderThanTheDeletion(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	z := &fakeReplZFS{guids: map[string]zfs.GUIDInventory{"tank/nd": {Entries: []zfs.GUIDEntry{
+		{Name: "tank/nd/win11", GUID: "g1"},
+	}}}}
+	rep := &Replicator{
+		Store: st, ZFS: z, Root: "tank/nd", Gate: ha.NewOpenGate(), Now: replTestClock(),
+		DBSnapshot: func(context.Context, string) error { return nil },
+		DBRevision: func() uint64 { return 7 },
+	}
+	if ok, err := rep.MarkOnce(ctx); err != nil || !ok {
+		t.Fatalf("第一轮：ok=%v err=%v", ok, err)
+	}
+	if ok, _ := rep.MarkOnce(ctx); ok {
+		t.Fatal("没有变化不该打")
+	}
+
+	rep.RotateMarkers()
+	rounds := 0
+	for i := 0; i < replicationMarkersKept+5; i++ {
+		ok, err := rep.MarkOnce(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			rounds++
+		}
+	}
+	// 留 N 个标记时，第 N 轮才把删除之前的全挤掉；多一轮给备机确认慢半拍的情况。
+	if rounds != replicationMarkersKept+1 {
+		t.Fatalf("打了 %d 轮，应当是 %d 轮，之后恢复安静", rounds, replicationMarkersKept+1)
+	}
+}
+
+// 不是写入者时不打标记，要打的轮数留着也不会算错。
+func TestRotateMarkersDoesNothingBehindAClosedGate(t *testing.T) {
+	ctx := context.Background()
+	gate := ha.NewOpenGate()
+	z := &fakeReplZFS{guids: map[string]zfs.GUIDInventory{"tank/nd": {Entries: []zfs.GUIDEntry{{Name: "tank/nd/win11", GUID: "g1"}}}}}
+	rep := &Replicator{
+		Store: newImageTestStore(t), ZFS: z, Root: "tank/nd", Gate: gate, Now: replTestClock(),
+		DBSnapshot: func(context.Context, string) error { return nil },
+		DBRevision: func() uint64 { return 7 },
+	}
+	if _, err := rep.MarkOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gate.Close("standby", "")
+	rep.RotateMarkers()
+	if ok, err := rep.MarkOnce(ctx); err != nil || ok {
+		t.Fatalf("备机不该打标记：ok=%v err=%v", ok, err)
+	}
+}
+
 func TestMarkOnceStaysQuietWhenNothingChanged(t *testing.T) {
 	ctx := context.Background()
 	st := newImageTestStore(t)
@@ -1719,6 +1781,37 @@ func TestPullOnceRollsBackRestorePointsThePeerDeleted(t *testing.T) {
 
 // 裁旧标记时要保住每台备机最后确认的那个，否则备机重启几分钟回来就没有共同快照、只能整体重建；
 // 超过一天没露面的备机不再保。
+// 这台当备机时，上一任写入者记下了它的确认点，这行随库复制过来。写入者不向自己拉取，留着它只会
+// 多钉住一个切换前的标记：删掉的文件 24 小时回不来，每次切换后都这样。
+func TestMarkOnceDoesNotPinItsOwnRowFromWhenItWasAStandby(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	now := time.Date(2026, 11, 6, 16, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *time.Time { v := now.Add(-d); return &v }
+	for _, row := range []domain.ReplicationState{
+		{Target: "http://10.0.0.4:8080", Kind: "primary-serve", LastSnapshot: "rep-50", LastOKAt: at(10 * time.Minute), UpdatedAt: now},
+		{Target: "http://10.0.0.5:8080", Kind: "primary-serve", LastSnapshot: "rep-100", LastOKAt: at(time.Minute), UpdatedAt: now},
+	} {
+		if err := st.ReplicationStates().Upsert(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	z := &fakeReplZFS{dbCopyDir: t.TempDir(), guids: map[string]zfs.GUIDInventory{
+		"tank/nd": {Entries: []zfs.GUIDEntry{{Name: "tank/nd/win11", GUID: "1"}}},
+	}}
+	rep := &Replicator{
+		Store: st, ZFS: z, Root: "tank/nd", Gate: ha.NewOpenGate(), Now: func() time.Time { return now },
+		SelfURL:    "http://10.0.0.4:8080",
+		DBSnapshot: func(context.Context, string) error { return nil },
+	}
+	if marked, err := rep.MarkOnce(ctx); err != nil || !marked {
+		t.Fatalf("mark = %v, %v", marked, err)
+	}
+	if len(z.prunes) != 1 || z.prunes[0] != "tank/nd|rep-|3|rep-100" {
+		t.Fatalf("prunes = %v，只该保住另一台备机的 rep-100", z.prunes)
+	}
+}
+
 func TestMarkOnceSparesWhatEachStandbyLastConfirmed(t *testing.T) {
 	ctx := context.Background()
 	st := newImageTestStore(t)
@@ -2646,5 +2739,64 @@ func TestAsidePrunePreservesABusinessHeadWithoutAnySharedSnapshot(t *testing.T) 
 	}
 	if len(z.headBases) > 0 {
 		t.Fatalf("private-only snapshot was treated as shared evidence: %v", z.headBases)
+	}
+}
+
+// 接收期间旧副本是失败时改回原名的退路，要挡住跨节点的旧副本清理；收完放开。
+func TestRebuildProtectsItsRollbackCopyWhileReceiving(t *testing.T) {
+	ctx := context.Background()
+	z := &fakeReplZFS{guids: map[string]zfs.GUIDInventory{"tank/nd": {Entries: []zfs.GUIDEntry{
+		{Name: "tank/nd/win11", GUID: "1"}, {Name: "tank/nd/win11@0", GUID: "2"},
+	}}}}
+	rep := &Replicator{ZFS: z, Peer: &fakeReplPeer{}, Root: "tank/nd", Now: replTestClock()}
+	var aside string
+	var protected bool
+	z.onRecv = func() {
+		for _, r := range z.renamed {
+			if name, ok := strings.CutPrefix(r, "tank/nd->"); ok {
+				aside = name
+			}
+		}
+		protected = storage.AsideInUse(aside)
+	}
+	if err := rep.rebuildPreserving(ctx, "rep-2"); err != nil {
+		t.Fatal(err)
+	}
+	if aside == "" || !protected {
+		t.Fatalf("接收期间退路没有受保护：aside=%q protected=%v", aside, protected)
+	}
+	if storage.AsideInUse(aside) {
+		t.Fatalf("重建结束后保护没有放开：%s", aside)
+	}
+}
+
+// 回收 held 原本只在拉取里跑，写入者不拉取：当过备机留下的暂存在它当写入者期间永远不回收。
+func TestWriterReclaimsHeldCopiesToo(t *testing.T) {
+	z := &fakeReplZFS{dbCopyDir: t.TempDir(), held: []string{"tank/nd-held-1", "tank/nd-held-2"},
+		clonesOf: map[string][]string{"tank/nd-held-2": {"tank/run/CLIENT-0E2EC1057E01"}}}
+	rep := &Replicator{ZFS: z, Root: "tank/nd", Gate: ha.NewOpenGate(), Now: replTestClock(),
+		DBSnapshot: func(context.Context, string) error { return nil }}
+	if _, err := rep.MarkOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(z.destroyed, "tank/nd-held-1") {
+		t.Fatalf("客户机已放手的暂存没有回收：%v", z.destroyed)
+	}
+	if contains(z.destroyed, "tank/nd-held-2") {
+		t.Fatalf("客户机还在用的暂存被删了：%v", z.destroyed)
+	}
+}
+
+// 备机由拉取负责回收，打标记的循环不碰池。
+func TestStandbyMarkLoopLeavesHeldCopiesAlone(t *testing.T) {
+	gate := ha.NewOpenGate()
+	gate.Close("备机", "http://a:8080")
+	z := &fakeReplZFS{held: []string{"tank/nd-held-1"}}
+	rep := &Replicator{ZFS: z, Root: "tank/nd", Gate: gate, Now: replTestClock()}
+	if _, err := rep.MarkOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if contains(z.destroyed, "tank/nd-held-1") {
+		t.Fatalf("备机的打标记循环动了池：%v", z.destroyed)
 	}
 }

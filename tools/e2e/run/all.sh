@@ -1,5 +1,5 @@
 #!/bin/bash
-# 九套回归：集群管理 / 负载均衡 / 三节点集群 / HA 自愈 / 双机热备 / 超管与数据盘发布 / 同镜像并发 / 集群备份 / 目录保全。
+# 十二套回归：集群管理 / 负载均衡 / 三节点集群 / HA 自愈 / 双机热备 / 超管与数据盘发布 / 同镜像并发 / 集群备份 / 存储池详情 / 删除导入文件 / 备机停服时删镜像 / 目录保全。
 # 跑在集群内部的某台节点上。用法：ND_ENV=... ./all.sh
 . "$(dirname "$0")/_common.sh"
 
@@ -45,6 +45,12 @@ run 6 "超管与数据盘发布" super_matrix.py "ND_BASE=http://$ND_VIP:8080"
 run 7 "同镜像并发"       concurrency_matrix.py "ND_BASE=http://$ND_VIP:8080"
 # 临时改备份配置、做一次计划切换，结束时还原并收走自己留下的副本。
 run 8 "集群备份"         backup_cluster_matrix.py
+# 只读，不留状态。要 ND_BASE 走 VIP：它默认连这台 SSH 对账，页面和 zfs 才是同一台。
+run 9 "存储池详情"       volume_matrix.py "ND_BASE=http://$ND_VIP:8080"
+# 只动自己上传的 64 MiB 文件，要等标记轮转，约 8 分钟。
+run 10 "删除导入文件"     import_delete_matrix.py "ND_BASE=http://$ND_VIP:8080"
+# 停一台备机几分钟（有定时器兜底），只删自己建的空白数据盘。
+run 11 "备机停服时删镜像" delete_standby_down_matrix.py
 # 放最后：它会在一台备机上制造分叉，那台要整体重建目录（几分钟）。
-run 9 "目录保全与可见性" catalogue_matrix.py "ND_BASE=http://$ND_VIP:8080"
+run 12 "目录保全与可见性" catalogue_matrix.py "ND_BASE=http://$ND_VIP:8080"
 echo ALL-DONE

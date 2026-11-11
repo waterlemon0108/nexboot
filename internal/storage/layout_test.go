@@ -174,3 +174,57 @@ func TestWinRECloneIsRecognisable(t *testing.T) {
 		t.Fatal("要和体检克隆名区分开，两者可能同时存在")
 	}
 }
+
+// 存储池详情靠名字判断对象是什么；认不出的一律归未识别（只读），不能猜。
+func TestClassifyPoolPath(t *testing.T) {
+	cases := []struct {
+		path string
+		kind PoolObjectKind
+		root string
+		name string
+	}{
+		{"", PoolObjectContainer, "", ""},
+		{"nd", PoolObjectContainer, "", ""},
+		{"run", PoolObjectContainer, "", ""},
+		{"ndiskless", PoolObjectContainer, "", ""},
+		{"nd/db", PoolObjectReserved, "", "db"},
+		{"nd/files", PoolObjectReserved, "", "files"},
+		{"nd/win10", PoolObjectCatalogue, "", "win10"},
+		{"nd/iso_3e8aaa1eed40f3f0_default", PoolObjectCatalogue, "", "iso_3e8aaa1eed40f3f0_default"},
+		{"nd/win10_default_before_super", PoolObjectSuperseded, "", "win10_default_before_super"},
+		{"nd/recv-1234-5", PoolObjectRecvTemp, "", "recv-1234-5"},
+		{"run/CLIENT-0050562EF65E", PoolObjectCarrier, "", "CLIENT-0050562EF65E"},
+		{"run/SCLIENT-0050562EF64E-DATA-1", PoolObjectCarrier, "", "SCLIENT-0050562EF64E-DATA-1"},
+		{"run/IDENT-7070FC0587A2", PoolObjectCarrier, "", "IDENT-7070FC0587A2"},
+		{"run/INSTALL-0050562EF64E-abc", PoolObjectCarrier, "", "INSTALL-0050562EF64E-abc"},
+		{"run/whatever", PoolObjectUnknown, "", "whatever"},
+		{"nd-rebuilding-1792388566008542804", PoolObjectRebuilding, "nd-rebuilding-1792388566008542804", ""},
+		{"nd-rebuilding-1792388566008542804/win10", PoolObjectAsideChild, "nd-rebuilding-1792388566008542804", "win10"},
+		{"nd-diverged-1792304492415187876", PoolObjectDiverged, "nd-diverged-1792304492415187876", ""},
+		{"nd-diverged-1792304492415187876/vmdk_default", PoolObjectAsideChild, "nd-diverged-1792304492415187876", "vmdk_default"},
+		{"nd-held-1792480000000000000", PoolObjectHeld, "nd-held-1792480000000000000", ""},
+		{"ndiskless/nd", PoolObjectBackupCopy, "", ""},
+		{"ndiskless/nd/win10", PoolObjectBackupItem, "", "win10"},
+		{"ndiskless/nd-rebuilding-1793000000000000000", PoolObjectBackupAside, "ndiskless/nd-rebuilding-1793000000000000000", ""},
+		{"ndiskless/nd-rebuilding-1793000000000000000/win10", PoolObjectAsideChild, "ndiskless/nd-rebuilding-1793000000000000000", "win10"},
+		{"imports", PoolObjectLegacyImports, "", ""},
+		// 名字差一点都不算：删除白名单以后也靠它。
+		{"nd-rebuilding-", PoolObjectUnknown, "", ""},
+		{"nd-rebuilding-12a", PoolObjectUnknown, "", ""},
+		{"nd-diverged", PoolObjectUnknown, "", ""},
+		{"ndx", PoolObjectUnknown, "", ""},
+		{"somedata", PoolObjectUnknown, "", ""},
+		{"nd/a/b", PoolObjectUnknown, "", ""},
+		{"run/a/b", PoolObjectUnknown, "", ""},
+		{"ndiskless/other", PoolObjectUnknown, "", ""},
+	}
+	for _, c := range cases {
+		got := ClassifyPoolPath(c.path)
+		if got.Kind != c.kind || got.Root != c.root || got.Name != c.name {
+			t.Errorf("ClassifyPoolPath(%q) = %+v, want kind=%s root=%q name=%q", c.path, got, c.kind, c.root, c.name)
+		}
+	}
+	if got := ClassifyPoolPath("run/IDENT-7070FC0587A2").Carrier; got.Kind != CarrierIdentity || got.MAC != "7070FC0587A2" {
+		t.Errorf("身份层没有反解出机器：%+v", got)
+	}
+}

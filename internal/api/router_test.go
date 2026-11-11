@@ -2628,3 +2628,125 @@ func TestStandbyForwardsBeforeCheckingItsStaleAddress(t *testing.T) {
 		t.Fatalf("写入者问不到时应按本地登记地址核对并拒绝，得到 %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+type recordingVolumes struct {
+	node, pool string
+	result     ops.PoolVolumesResult
+	err        error
+}
+
+func (r *recordingVolumes) List(_ context.Context, node, pool string) (ops.PoolVolumesResult, error) {
+	r.node, r.pool = node, pool
+	return r.result, r.err
+}
+
+type recordingImportFiles struct {
+	names []string
+	err   error
+}
+
+func (r *recordingImportFiles) Delete(_ context.Context, name string) error {
+	r.names = append(r.names, name)
+	return r.err
+}
+
+func TestDeleteImportFileEndpointDecodesTheName(t *testing.T) {
+	files := &recordingImportFiles{}
+	req := httptest.NewRequest(http.MethodDelete, "/api/volumes/imports/Win11%20%E4%B8%AD%E6%96%87.iso", nil)
+	rec := httptest.NewRecorder()
+	NewRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Services{ImportFiles: files}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(files.names) != 1 || files.names[0] != "Win11 中文.iso" {
+		t.Fatalf("名字没有解码：%q", files.names)
+	}
+}
+
+// 编码过的斜杠不能被当成路径分隔，要原样交给服务去拒绝。
+func TestDeleteImportFileEndpointHandsEncodedSlashToTheService(t *testing.T) {
+	files := &recordingImportFiles{err: errs.Invalid("请从列表里选")}
+	req := httptest.NewRequest(http.MethodDelete, "/api/volumes/imports/..%2F..%2Fetc%2Fpasswd", nil)
+	rec := httptest.NewRecorder()
+	NewRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Services{ImportFiles: files}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(files.names) != 1 || files.names[0] != "../../etc/passwd" {
+		t.Fatalf("服务拿到的名字不对：%q", files.names)
+	}
+}
+
+func TestDeleteImportFileIsAuditedAsStorageDelete(t *testing.T) {
+	module, action := deriveModuleAction(http.MethodDelete, "/api/volumes/imports/win.iso")
+	if module != "存储" || action != "删除" {
+		t.Fatalf("审计记成了 %s/%s", module, action)
+	}
+}
+
+func TestVolumesEndpointPassesNodeAndPool(t *testing.T) {
+	volumes := &recordingVolumes{result: ops.PoolVolumesResult{Pool: "tank", Reachable: true}}
+	req := httptest.NewRequest(http.MethodGet, "/api/volumes?node=n2&pool=tank", nil)
+	rec := httptest.NewRecorder()
+	NewRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Services{Volumes: volumes}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if volumes.node != "n2" || volumes.pool != "tank" {
+		t.Fatalf("参数没有传到服务：%q %q", volumes.node, volumes.pool)
+	}
+	var got ops.PoolVolumesResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || got.Pool != "tank" || !got.Reachable {
+		t.Fatalf("应答不对：%s %v", rec.Body.String(), err)
+	}
+}
+
+func TestVolumesEndpointReportsInvalidRequests(t *testing.T) {
+	volumes := &recordingVolumes{err: errs.Invalid("要看哪个存储池？")}
+	req := httptest.NewRequest(http.MethodGet, "/api/volumes", nil)
+	rec := httptest.NewRecorder()
+	NewRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Services{Volumes: volumes}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "存储池") {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 流里是节点的全部内容清单：没有集群令牌不给。
+func TestNodeVolumesEndpointNeedsTheClusterToken(t *testing.T) {
+	var asked string
+	svc := Services{ClusterToken: "tok", NodeVolumes: func(_ context.Context, pool string) (storage.PoolFacts, error) {
+		asked = pool
+		return storage.PoolFacts{Pool: pool, Used: 42}, nil
+	}}
+	router := NewRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, svc)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/node/volumes?pool=tank", nil))
+	if rec.Code != http.StatusUnauthorized || asked != "" {
+		t.Fatalf("没带令牌：status=%d asked=%q", rec.Code, asked)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/internal/node/volumes?pool=tank", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || asked != "tank" {
+		t.Fatalf("带令牌：status=%d asked=%q body=%s", rec.Code, asked, rec.Body.String())
+	}
+	var got storage.PoolFacts
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || got.Used != 42 {
+		t.Fatalf("应答不对：%s %v", rec.Body.String(), err)
+	}
+}
+
+// 节点读失败要把原因带回去，写入者据此说明读不到，不能显示成空池。
+func TestNodeVolumesEndpointReportsAReadFailure(t *testing.T) {
+	svc := Services{ClusterToken: "tok", NodeVolumes: func(context.Context, string) (storage.PoolFacts, error) {
+		return storage.PoolFacts{}, errors.New("这台服务器上没有存储池 gone")
+	}}
+	req := httptest.NewRequest(http.MethodGet, "/internal/node/volumes?pool=gone", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	NewRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, svc).ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK || !strings.Contains(rec.Body.String(), "gone") {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+}

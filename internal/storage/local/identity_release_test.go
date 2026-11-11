@@ -168,3 +168,19 @@ func TestReleaseIdentityLayersProtectsTheGapBetweenIdentityPrepareAndClientProvi
 		t.Fatal("foreground identity prepare was deleted before CreateClientLUN could use it")
 	}
 }
+
+// 暂存的数据被空闲身份层克隆着时要能释放，否则这份数据永远回收不掉。
+func TestReleaseIdentityLayersAcceptsAHeldCopyAsSource(t *testing.T) {
+	const layer = "tank/run/IDENT-001122334455"
+	z := newFakePool()
+	z.datasets = []string{"tank/nd-held-1", layer}
+	z.origin[layer] = "tank/nd-held-1@0"
+	a := New("node-a", z, &fakeExporter{})
+	released, err := a.ReleaseIdentityLayers(context.Background(), []string{"tank/nd-held-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(released, []string{"001122334455"}) || z.present(layer) {
+		t.Fatalf("身份层没有释放：released=%v datasets=%v", released, z.datasets)
+	}
+}

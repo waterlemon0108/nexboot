@@ -6,6 +6,7 @@ import { api } from '../../lib/api.js';
 import { StoreProvider } from '../store.jsx';
 import { ConfirmProvider } from '../overlay.jsx';
 import { PageStorage } from './storage.jsx';
+import { fmtDateTime } from '../../lib/format.js';
 
 // 销毁会带走池上全部镜像、配置、还原点和克隆且无法恢复，销毁与建池的护栏都要有测试。
 
@@ -40,6 +41,10 @@ const DISKS = [
   { Path: '/dev/sda', Name: 'sda', Size: 500e9, InUse: true },
 ];
 
+const EMPTY_VOLUMES = { reachable: true, authoritative: true, role: 'data', node_role: 'single', used: 0, available: 0, freeing: 0,
+  sync: { level: 'ok', pending: 0 }, categories: [], unused: { count: 0, bytes: 0 }, images: [], imports: [], files_readable: true,
+  clients: [], residues: [], system: [] };
+
 function stubApi(overrides = {}) {
   const base = {
     listPools: async () => list(POOLS),
@@ -52,6 +57,7 @@ function stubApi(overrides = {}) {
     listClusterNodes: async () => list([]),
     listClusterPools: async () => ({ nodes: [], total_capacity: 0, total_used: 0, pool_count: 0 }),
     listClusterDisks: async () => list(DISKS),
+    listVolumes: async () => EMPTY_VOLUMES,
   };
   for (const [name, fn] of Object.entries({ ...base, ...overrides })) {
     vi.spyOn(api, name).mockImplementation(fn);
@@ -61,6 +67,13 @@ function stubApi(overrides = {}) {
 const renderPage = () => render(
   <StoreProvider><ConfirmProvider><PageStorage/></ConfirmProvider></StoreProvider>,
 );
+
+// 磁盘管理搬进了存储池详情：点列表里的池，再点「磁盘与缓存」。
+const showDisks = () => screen.findByRole('button', { name: '磁盘与缓存' }).then(b => userEvent.click(b));
+const openDisks = async (name) => {
+  await userEvent.click(await screen.findByText(name));
+  await showDisks();
+};
 
 // 集群下要列出每台节点的池（容量和健康只有池所在节点读得出），服务器列写 IP 而不是节点 ID 哈希。
 describe('存储页的集群口径', () => {
@@ -112,7 +125,7 @@ describe('存储页的集群口径', () => {
     const usedCard = (await screen.findByText('已使用')).closest('.stat-card');
     expect(usedCard.textContent).toMatch(/不含.*1 台/);
     // 节点那张卡说清有几台读不到
-    const poolCard = (await screen.findByText('存储池')).closest('.stat-card');
+    const poolCard = (await screen.findAllByText('存储池')).map(el => el.closest('.stat-card')).find(Boolean);
     expect(poolCard.textContent).toMatch(/1 台读不到/);
     // 不再为此单开一块横幅
     expect(screen.queryByText(/上面的总容量与使用率/)).toBeNull();
@@ -213,14 +226,23 @@ describe('存储页的集群口径', () => {
   });
 
   // 节点 ID 是 machine-id 的哈希，详情里也写 IP。
+  it('集群里按节点和池名取：几台的池可能同名', async () => {
+    const listVolumes = vi.fn(async () => EMPTY_VOLUMES);
+    stubCluster({ listVolumes });
+    renderPage();
+    const rows = await screen.findAllByText('tank');
+    await userEvent.click(rows[rows.length - 1]);
+    await waitFor(() => expect(listVolumes).toHaveBeenCalledWith('n2', 'tank'));
+  });
+
   it('池详情里的服务器写 IP', async () => {
     stubCluster();
     renderPage();
     const rows = await screen.findAllByText('tank');
     await userEvent.click(rows[rows.length - 1]);
-    const dlg = (await screen.findByText(/存储池详情/)).closest('.card');
-    expect(within(dlg).getByText('192.168.10.4')).toBeTruthy();
-    expect(within(dlg).queryByText('n2')).toBeNull();
+    const header = await screen.findByTestId('pool-header');
+    expect(within(header).getByText('192.168.10.4')).toBeTruthy();
+    expect(within(header).queryByText('n2')).toBeNull();
   });
 
   // 对别的节点的池操作，后果在另一台机器上，确认时要点明目标节点。
@@ -236,6 +258,7 @@ describe('存储页的集群口径', () => {
       return r;
     });
     await userEvent.click(peerRow);
+    await showDisks();
     await userEvent.click(await screen.findByRole('button', { name: /销毁存储池/ }));
     const dialog = (await screen.findByText(/将删除该池及其全部数据/)).closest('.card');
     // 强确认输入目标节点而不是池名：几台的池都叫 tank。
@@ -339,7 +362,7 @@ describe('存储页', () => {
     const deletePool = vi.fn(async () => ({ task_id: 'task-destroy_pool-1' }));
     stubApi({ deletePool });
     renderPage();
-    await userEvent.click(await screen.findByText('tank'));
+    await openDisks('tank');
 
     await userEvent.click(await screen.findByRole('button', { name: /销毁/ }));
     const dialog = await screen.findByText(/无法恢复/);
@@ -473,7 +496,7 @@ describe('存储页', () => {
     const addPoolDisk = vi.fn(async () => ({ task_id: 'task-add_disk-1' }));
     stubApi({ addPoolDisk });
     renderPage();
-    await userEvent.click(await screen.findByText('cold'));
+    await openDisks('cold');
     await screen.findByText('mirror-0');
 
     // 扩容：分区的「添加」打开选盘框，一块盘不成组。
@@ -500,7 +523,7 @@ describe('存储页', () => {
   it('raidz 池整组加盘且没有加镜像盘', async () => {
     stubApi({ listPools: async () => list([...POOLS, RAIDZ_POOL]) });
     renderPage();
-    await userEvent.click(await screen.findByText('backup'));
+    await openDisks('backup');
     await screen.findByText('raidz2-0');
     expect(screen.queryByRole('button', { name: /加 RAID1 盘/ })).toBeNull();
 
@@ -516,7 +539,7 @@ describe('存储页', () => {
     const replacePoolDisk = vi.fn(async () => ({ task_id: 'task-replace_disk-1' }));
     stubApi({ listPools: async () => list([...POOLS, RAIDZ_POOL]), replacePoolDisk });
     renderPage();
-    await userEvent.click(await screen.findByText('backup'));
+    await openDisks('backup');
     await screen.findByText('raidz2-0');
     expect(screen.queryByRole('button', { name: /^移除 \/dev/ })).toBeNull();
     expect(screen.getByText(/raidz 不能移盘/)).toBeTruthy();
@@ -533,7 +556,7 @@ describe('存储页', () => {
     const removePoolDisk = vi.fn(async () => ({ task_id: 'task-detach_disk-1' }));
     stubApi({ removePoolDisk });
     renderPage();
-    await userEvent.click(await screen.findByText('cold'));
+    await openDisks('cold');
     await screen.findByText('mirror-0');
 
     await userEvent.click(screen.getByRole('button', { name: '移除 /dev/sdb' }));
@@ -553,7 +576,7 @@ describe('存储页', () => {
     const mirrorUpgradePool = vi.fn(async () => ({ task_id: 'task-mirror_upgrade-1' }));
     stubApi({ mirrorUpgradePool, listPools: async () => list([{ ...POOLS[0], Disks: ['sda', 'sdb'] }]) });
     renderPage();
-    await userEvent.click(await screen.findByText('tank'));
+    await openDisks('tank');
     await userEvent.click(await screen.findByRole('button', { name: /升级为 RAID1/ }));
 
     const start = await screen.findByRole('button', { name: '开始升级' });
@@ -570,7 +593,7 @@ describe('存储页', () => {
   // 只有一块数据盘时「升级」和这块盘的「加 RAID1 盘」是同一件事，只留后者。
   it('单盘条带池不显示升级，只给这块盘加 RAID1 盘', async () => {
     renderPage();
-    await userEvent.click(await screen.findByText('tank'));
+    await openDisks('tank');
     expect(await screen.findByRole('button', { name: '给 sda 加 RAID1 盘' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: /升级为 RAID1/ })).toBeNull();
   });
@@ -582,7 +605,7 @@ describe('存储页', () => {
     const removeSpare = vi.fn(async () => ({ task_id: 'task-remove_spare-1' }));
     stubApi({ addSpecial, addSpare, removeSpare });
     renderPage();
-    await userEvent.click(await screen.findByText('cold'));
+    await openDisks('cold');
     await screen.findByText('mirror-0');
 
     const addButtons = screen.getAllByRole('button', { name: /添加/ });
@@ -611,7 +634,7 @@ describe('存储页', () => {
     const addPoolDisk = vi.fn(async () => ({ task_id: 'task-add_disk-1' }));
     stubApi({ addPoolDisk, listPools: async () => list([...POOLS, { ...RAIDZ_POOL, RaidzExpandable: false, RaidzExpandNote: '本机 ZFS 用户态版本 2.2.2 不支持 raidz 单盘扩容（需 ≥ 2.3）' }]) });
     const { unmount } = renderPage();
-    await userEvent.click(await screen.findByText('backup'));
+    await openDisks('backup');
     await screen.findByText('raidz2-0');
     expect(screen.queryByRole('button', { name: /扩一块盘/ })).toBeNull();
     expect(screen.getByText(/不支持 raidz 单盘扩容/)).toBeTruthy();
@@ -619,7 +642,7 @@ describe('存储页', () => {
 
     stubApi({ addPoolDisk, listPools: async () => list([...POOLS, { ...RAIDZ_POOL, RaidzExpandable: true }]) });
     renderPage();
-    await userEvent.click(await screen.findByText('backup'));
+    await openDisks('backup');
     await userEvent.click(await screen.findByRole('button', { name: '给 raidz2-0 扩一块盘' }));
     const confirm = await screen.findByRole('button', { name: '确认' });
     await userEvent.click(screen.getByText(/sdc/));
@@ -634,6 +657,7 @@ describe('存储页', () => {
     expect(screen.getByText('条带')).toBeTruthy();
 
     await userEvent.click(screen.getByText('cold'));
+    await showDisks();
     expect(await screen.findByText('mirror-0')).toBeTruthy();
     expect(screen.getByText('mirror-1')).toBeTruthy();
     const row = screen.getByText('/dev/sdd').closest('tr');
@@ -670,12 +694,369 @@ describe('别的节点的池详情', () => {
       listClusterDisks,
     });
     renderPage();
-    await userEvent.click(await screen.findByText('cold'));
+    await openDisks('cold');
     await screen.findByText('mirror-0');
     await waitFor(() => expect(listClusterDisks).toHaveBeenCalledWith('n2'));
     await userEvent.click(screen.getAllByRole('button', { name: /添加/ })[0]);
     await screen.findByRole('button', { name: '确认' });
     expect(await screen.findByText(/sdx/)).toBeTruthy();
     expect(screen.queryByText(/sdc/)).toBeNull();
+  });
+});
+
+const VOLUMES = {
+  node: 'n1', ip: '192.168.10.3', node_role: 'writer', pool: 'tank', role: 'data', reachable: true, authoritative: true,
+  used: 51069820928, available: 51942576128, freeing: 0,
+  sync: { level: 'ok', message: '备机都已跟上', pending: 0 },
+  categories: [
+    { id: 'images', bytes: 37300000000, count: 3 }, { id: 'imports', bytes: 12230628352, count: 2 },
+    { id: 'client', bytes: 9158656, count: 1 }, { id: 'system', bytes: 1500000000, count: 3 },
+  ],
+  unused: { count: 1, bytes: 9266802688 },
+  images: [
+    { id: 'iso_3e8a', name: 'win11_25h2', dataset: 'nd/iso_3e8a', used: 11851771904, size: 68719476736, configs: 1, points: 3, users: ['分组 test', '超管机 11'], created_at: '2026-10-22T03:19:51Z' },
+    { id: 'cn-win11', name: 'cn-win11', dataset: 'nd/cn-win11', used: 9266802688, size: 68719476736, configs: 1, points: 1, users: [], created_at: '2026-10-19T19:10:50Z' },
+    { id: 'old', name: 'old', dataset: 'nd/old', used: 1073741824, size: 0, configs: 1, points: 1, users: [], state: 'pending_delete' },
+  ],
+  imports: [{ name: 'Win11.iso', size: 7774558208, used: 7659381248, modified_at: '2026-10-22T02:54:00Z' }],
+  files_readable: true,
+  clients: [{ mac: '0050562EF65F', name: '22', known: true, state: 'offline', is_super: false, offline_at: '2026-10-22T08:19:01Z', used: 9158656,
+    disks: [{ dataset: 'run/IDENT-0050562EF65F', kind: 'identity', lun: 0, used: 9158656, source: 'win11_25h2 @2' }] }],
+  residues: [],
+  system: [{ kind: 'files_dir', name: 'winpe', path: 'nd/files/winpe', used: 1499433472 }, { kind: 'db', path: 'nd/db', used: 1511424 }, { kind: 'rep_markers', path: 'rep-*', used: 1220608, count: 64 }],
+};
+
+describe('存储池详情', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('标签名固定，没选池时提示先去列表选', async () => {
+    stubApi();
+    renderPage();
+    await screen.findByText('cold');
+    expect(screen.getByRole('button', { name: '存储池详情' })).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: '存储池详情' }));
+    expect(await screen.findByText(/请先在「存储池」列表里点一个池/)).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: '去选择' }));
+    expect(await screen.findByText('cold')).toBeTruthy();
+  });
+
+  it('点列表里的池跳到详情，只展示这个池', async () => {
+    const listVolumes = vi.fn(async () => VOLUMES);
+    stubApi({ listVolumes });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    const header = await screen.findByTestId('pool-header');
+    expect(within(header).getByText('tank')).toBeTruthy();
+    expect(screen.queryByText('cold')).toBeNull();
+    expect(screen.getByRole('button', { name: '存储池详情' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /tank ·/ })).toBeNull();
+    await waitFor(() => expect(listVolumes).toHaveBeenCalledWith('', 'tank'));
+    await screen.findByText('win11_25h2');
+    expect(within(header).getByText(/备机都已跟上/)).toBeTruthy();
+    expect(within(header).getByText(/已用 47\.6 GiB/)).toBeTruthy();
+  });
+
+  it('单机模式的页头也写服务器地址，不写节点 ID', async () => {
+    stubApi({
+      listPools: async () => ({ items: [{ ...POOLS[0], ServerID: 'b7efc2589bae' }] }),
+      listVolumes: async () => ({ ...VOLUMES, ip: '192.168.50.1' }),
+    });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    const header = await screen.findByTestId('pool-header');
+    expect(await within(header).findByText('192.168.50.1')).toBeTruthy();
+    expect(within(header).queryByText('b7efc2589bae')).toBeNull();
+  });
+
+  it('类别按钮带占用，切换后列对应的内容', async () => {
+    stubApi({ listVolumes: async () => VOLUMES });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    const images = await screen.findByRole('button', { name: /镜像与配置/ });
+    expect(images.textContent).toContain('34.74 GiB');
+    expect(screen.queryByRole('button', { name: /残留/ })).toBeNull();
+
+    await userEvent.click(screen.getByRole('button', { name: /导入文件/ }));
+    const file = (await screen.findByText('Win11.iso')).closest('tr');
+    expect(file.textContent).toContain(fmtDateTime('2026-10-22T02:54:00Z'));
+    expect(within(file.closest('table')).getByRole('columnheader', { name: '上传时间' })).toBeTruthy();
+    expect(screen.queryByText('win11_25h2')).toBeNull();
+
+    await userEvent.click(screen.getByRole('button', { name: /客户机盘/ }));
+    const row = (await screen.findByText('22')).closest('tr');
+    expect(row.textContent).toContain('00:50:56:2E:F6:5F');
+    expect(row.textContent).toContain('网卡层');
+    expect(row.textContent).not.toContain('身份层');
+    expect(screen.getByText(/网卡层存这台机器的网卡信息，提前做好/)).toBeTruthy();
+    expect(row.textContent).toContain('win11_25h2 @2');
+
+    await userEvent.click(screen.getByRole('button', { name: /^系统/ }));
+    expect(await screen.findByText('WinPE 适配环境')).toBeTruthy();
+    expect(screen.getByText('同步记录').closest('tr').textContent).toContain('不用处理');
+  });
+
+  it('客户机盘每台一句，明细放悬停；来源写还原点', async () => {
+    const clients = [{
+      mac: '0050562EF650', name: '33', known: true, state: 'online', is_super: false, used: 330 * 2 ** 20,
+      disks: [
+        { dataset: 'run/CLIENT-0050562EF650', kind: 'client', lun: 0, used: 300 * 2 ** 20, source: 'win11_25h2 @2' },
+        { dataset: 'run/CLIENT-0050562EF650-DATA-1', kind: 'client', lun: 1, used: 2 ** 20, source: 'data @0' },
+        { dataset: 'run/CLIENT-0050562EF650-DATA-2', kind: 'client', lun: 2, used: 2 ** 20, source: 'data2 @0' },
+        { dataset: 'run/IDENT-0050562EF650', kind: 'identity', lun: 0, used: 9 * 2 ** 20, source: 'win11_25h2 @2' },
+      ],
+    }, {
+      mac: '0050562EF64E', name: '11', known: true, state: 'online', is_super: true, used: 2 ** 30,
+      disks: [
+        { dataset: 'run/SCLIENT-0050562EF64E', kind: 'super', lun: 0, used: 2 ** 30, source: 'win11_25h2 @2' },
+        { dataset: 'run/SCLIENT-0050562EF64E-DATA-1', kind: 'super', lun: 1, used: 2 ** 20, source: 'data @0' },
+      ],
+    }];
+    stubApi({ listVolumes: async () => ({ ...VOLUMES, clients }) });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    await userEvent.click(await screen.findByRole('button', { name: /客户机盘/ }));
+    const row = (await screen.findByText('33')).closest('tr');
+    expect(row.querySelectorAll('.chip').length).toBe(0);
+    const disks = within(row).getByText('临时盘 3 块');
+    expect(disks.title).toBe('系统盘 300.0 MiB、数据盘 1.0 MiB、数据盘 1.0 MiB、网卡层 9.0 MiB');
+    expect(row.textContent).toContain('在线 · 来自 win11_25h2 @2');
+    const sup = screen.getByText('11').closest('tr');
+    expect(sup.querySelectorAll('.chip').length).toBe(0);
+    expect(within(sup).getByText('超管盘 2 块').title).toBe('系统盘 1.00 GiB、数据盘 1.0 MiB');
+  });
+
+  it('空的类别不显示，读不到文件库时导入文件要留着说明', async () => {
+    const empty = [{ id: 'images', bytes: 2 ** 30, count: 1 }, { id: 'imports', bytes: 0, count: 0 }, { id: 'client', bytes: 0, count: 0 }, { id: 'system', bytes: 2 ** 30, count: 1 }];
+    stubApi({ listVolumes: async () => ({ ...VOLUMES, categories: empty }) });
+    const { unmount } = renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    await screen.findByRole('button', { name: /镜像与配置/ });
+    expect(screen.queryByRole('button', { name: /导入文件/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /客户机盘/ })).toBeNull();
+    expect(screen.getByRole('button', { name: /^系统/ })).toBeTruthy();
+    unmount();
+
+    stubApi({ listVolumes: async () => ({ ...VOLUMES, categories: empty, files_readable: false }) });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    expect(await screen.findByRole('button', { name: /导入文件/ })).toBeTruthy();
+  });
+
+  it('镜像列表只看占用：有镜像类型，没有谁在用、管理和那行提示', async () => {
+    const images = [
+      ...VOLUMES.images,
+      { id: 'data', name: 'data', dataset: 'nd/data', used: 712, size: 20 * 2 ** 30, configs: 1, points: 3, users: ['分组 test 的 E:'], purpose: 'data' },
+    ];
+    stubApi({ listVolumes: async () => ({ ...VOLUMES, images }) });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    const row = (await screen.findByText('cn-win11')).closest('tr');
+    expect(row.textContent).toContain('1 个配置 · 1 个还原点');
+    expect(row.textContent).toContain('系统盘');
+    expect(within(row).queryByRole('button')).toBeNull();
+    expect(screen.getByText('data').closest('tr').textContent).toContain('数据盘');
+
+    const table = row.closest('table');
+    expect(within(table).getByRole('columnheader', { name: '镜像类型' })).toBeTruthy();
+    expect(within(table).getByRole('columnheader', { name: '创建时间' })).toBeTruthy();
+    expect(row.textContent).toContain(fmtDateTime('2026-10-19T19:10:50Z'));
+    expect(within(table).queryByRole('columnheader', { name: '谁在用' })).toBeNull();
+    expect(row.textContent).not.toContain('未使用');
+    expect(screen.queryByText(/要删请到镜像管理/)).toBeNull();
+    expect(screen.queryByText(/个未使用/)).toBeNull();
+    expect(screen.queryByRole('checkbox', { name: '只看未使用' })).toBeNull();
+  });
+
+  it('主机已删、这台还有的镜像标待复制删除，悬停看原因', async () => {
+    stubApi({ listVolumes: async () => VOLUMES });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    const row = (await screen.findByText('old')).closest('tr');
+    expect(within(row).getByText('待复制删除').title).toContain('下一轮复制跟随');
+    expect(row.textContent).not.toContain('系统盘');
+  });
+
+  describe('删除导入文件', () => {
+    const clusterStub = {
+      listClusterNodes: async () => list([
+        { id: 'n1', ip: '192.168.10.3', ha_state: 'active', online: true },
+        { id: 'n2', ip: '192.168.10.4', ha_state: 'standby', online: true },
+        { id: 'n3', ip: '192.168.10.5', ha_state: 'standby', online: false },
+      ]),
+      listClusterPools: async () => ({
+        total_capacity: 1, total_used: 0, pool_count: 1,
+        nodes: [
+          { node_id: 'n1', ip: '192.168.10.3', role: 'active', is_self: true, online: true, reachable: true, pools: [{ ...POOLS[0], ServerID: 'n1' }] },
+          { node_id: 'n2', ip: '192.168.10.4', role: 'standby', online: true, reachable: true, pools: [] },
+          { node_id: 'n3', ip: '192.168.10.5', role: 'standby', online: false, reachable: false, pools: [] },
+        ],
+      }),
+    };
+    const openImports = async () => {
+      await userEvent.click(await screen.findByText('tank'));
+      await userEvent.click(await screen.findByRole('button', { name: /导入文件/ }));
+      return screen.findByRole('button', { name: '删除 Win11.iso' });
+    };
+
+    it('确认框逐台说明影响和空间什么时候回来，确认后才删并刷新', async () => {
+      const deleteImportFile = vi.fn(async () => ({}));
+      const listVolumes = vi.fn(async () => VOLUMES);
+      stubApi({ ...clusterStub, listVolumes, deleteImportFile });
+      renderPage();
+      await userEvent.click(await openImports());
+      const message = (await screen.findByText(/删除 Win11\.iso？/)).textContent;
+      expect(message).toContain('已经导入的镜像不受影响');
+      expect(message).toContain('192.168.10.3：立刻删除');
+      expect(message).toContain('192.168.10.4：下一轮同步时跟着删');
+      expect(message).toContain('192.168.10.5：离线，恢复后跟着删');
+      expect(message).toContain('空间约 5 分钟后释放');
+      expect(deleteImportFile).not.toHaveBeenCalled();
+      const before = listVolumes.mock.calls.length;
+      await userEvent.click(screen.getByRole('button', { name: '删除' }));
+      await waitFor(() => expect(deleteImportFile).toHaveBeenCalledWith('Win11.iso'));
+      await waitFor(() => expect(listVolumes.mock.calls.length).toBeGreaterThan(before));
+    });
+
+    it('取消就不删', async () => {
+      const deleteImportFile = vi.fn(async () => ({}));
+      stubApi({ listVolumes: async () => VOLUMES, deleteImportFile });
+      renderPage();
+      await userEvent.click(await openImports());
+      await userEvent.click(await screen.findByRole('button', { name: '取消' }));
+      expect(deleteImportFile).not.toHaveBeenCalled();
+    });
+
+    it('单机没有复制，空间马上释放', async () => {
+      stubApi({ listVolumes: async () => ({ ...VOLUMES, node_role: 'single' }) });
+      renderPage();
+      await userEvent.click(await openImports());
+      const message = (await screen.findByText(/删除 Win11\.iso？/)).textContent;
+      expect(message).toContain('空间马上释放');
+      expect(message).not.toContain('下一轮');
+    });
+
+    it('有备份标记时照实说要等备份轮转', async () => {
+      const system = [...VOLUMES.system, { kind: 'backup_markers', path: 'ndbackup-*', used: 1, count: 3 }];
+      stubApi({ listVolumes: async () => ({ ...VOLUMES, node_role: 'single', system }) });
+      renderPage();
+      await userEvent.click(await openImports());
+      const message = (await screen.findByText(/删除 Win11\.iso？/)).textContent;
+      expect(message).toContain('要再跑 3 轮备份');
+      expect(message).not.toContain('空间马上释放');
+    });
+
+    it('被拒绝时把服务端的原因说出来', async () => {
+      const deleteImportFile = vi.fn(async () => { throw new Error('请先等 教室一号机 装完或取消这次安装，再删除 Win11.iso：安装正在用这个文件'); });
+      stubApi({ listVolumes: async () => VOLUMES, deleteImportFile });
+      renderPage();
+      await userEvent.click(await openImports());
+      await userEvent.click(await screen.findByRole('button', { name: '删除' }));
+      expect(await screen.findByText(/请先等 教室一号机 装完/)).toBeTruthy();
+      expect(screen.getByText('Win11.iso')).toBeTruthy();
+    });
+
+    it('主机已删、这台还没跟上的文件标待复制删除，不能再删', async () => {
+      const imports = [...VOLUMES.imports, { name: 'CentOS.iso', size: 2 ** 30, used: 2 ** 30, state: 'pending_delete' }];
+      stubApi({ listVolumes: async () => ({ ...VOLUMES, imports }) });
+      renderPage();
+      await openImports();
+      const row = screen.getByText('CentOS.iso').closest('tr');
+      expect(within(row).getByText('待复制删除').title).toContain('下一轮同步时跟着删');
+      expect(within(row).queryByRole('button')).toBeNull();
+      expect(screen.getByRole('button', { name: '删除 Win11.iso' })).toBeTruthy();
+    });
+
+    it('直连备机时库不权威，不给删除入口', async () => {
+      stubApi({ listVolumes: async () => ({ ...VOLUMES, authoritative: false }) });
+      renderPage();
+      await userEvent.click(await screen.findByText('tank'));
+      await userEvent.click(await screen.findByRole('button', { name: /导入文件/ }));
+      expect(await screen.findByText('Win11.iso')).toBeTruthy();
+      expect(screen.queryByRole('button', { name: /^删除/ })).toBeNull();
+    });
+
+    it('删掉还没释放的空间在系统里说明', async () => {
+      const system = [...VOLUMES.system, { kind: 'deleted_files', path: 'nd/files', used: 7 * 2 ** 30 }];
+      stubApi({ listVolumes: async () => ({ ...VOLUMES, system }) });
+      renderPage();
+      await userEvent.click(await screen.findByText('tank'));
+      await userEvent.click(await screen.findByRole('button', { name: /^系统/ }));
+      const row = (await screen.findByText('已删除的文件')).closest('tr');
+      expect(row.textContent).toContain('7.00 GiB');
+      expect(row.textContent).toContain('释放');
+    });
+  });
+
+  it('读不到节点时说明原因，不显示成空', async () => {
+    stubApi({ listVolumes: async () => ({ reachable: false, error: '192.168.10.4 没有应答，看不到这个池里有什么（这不代表池里没有卷）：connection refused', categories: [], images: [], imports: [], clients: [], residues: [], system: [], sync: { level: 'ok', pending: 0 }, unused: { count: 0, bytes: 0 } }) });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    expect(await screen.findByText(/这不代表池里没有卷/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /镜像与配置/ })).toBeNull();
+    // 磁盘管理不受影响：节点读不到卷时也能进。
+    expect(screen.getByRole('button', { name: '磁盘与缓存' })).toBeTruthy();
+  });
+
+  it('文件库没挂载时不说没有文件', async () => {
+    stubApi({ listVolumes: async () => ({ ...VOLUMES, imports: [], files_readable: false }) });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    await userEvent.click(await screen.findByRole('button', { name: /导入文件/ }));
+    expect(await screen.findByText(/文件库没有挂载/)).toBeTruthy();
+  });
+
+  it('残留说明是什么、谁还在用', async () => {
+    const residues = [
+      { dataset: 'nd-diverged-1', kind: 'diverged', used: 19.5 * 2 ** 30, created_at: '2026-10-18T06:21:00Z', points: 4, unique: ['vmdk_default@realtek', 'ubuntu_default@1'] },
+      { dataset: 'nd-rebuilding-2', kind: 'rebuilding', used: 2 ** 30, created_at: '2026-10-19T05:42:00Z', points: 4 },
+      { dataset: 'nd-held-3', kind: 'held', used: 2 ** 30, created_at: '2026-10-19T05:42:00Z', points: 1, dependents: ['33'] },
+      { dataset: 'nd/lost', kind: 'unregistered', used: 2 ** 30, has_baseline: true },
+    ];
+    stubApi({ listVolumes: async () => ({ ...VOLUMES, residues, categories: [...VOLUMES.categories, { id: 'residue', bytes: 22 * 2 ** 30, count: 4 }] }) });
+    renderPage();
+    await userEvent.click(await screen.findByText('tank'));
+    await userEvent.click(await screen.findByRole('button', { name: /残留/ }));
+    const diverged = (await screen.findByText('分叉副本')).closest('tr');
+    expect(diverged.textContent).toContain('2 个当前目录里没有的还原点');
+    expect(diverged.textContent).toContain(fmtDateTime('2026-10-18T06:21:00Z'));
+    expect(within(diverged.closest('table')).getByRole('columnheader', { name: '产生时间' })).toBeTruthy();
+    expect(screen.getByText('重建留下的旧副本').closest('tr').textContent).toContain('当前目录已有同样内容');
+    expect(screen.getByText('等客户机放手的数据').closest('tr').textContent).toContain('33 还在用');
+    expect(screen.getByText('未登记的卷').closest('tr').textContent).toContain('下次重启');
+  });
+
+  it('备份池列副本里有什么，并和数据池比较，成员没有删除', async () => {
+    const backupPool = { ...POOLS[0], ID: 'pool-backup', Name: 'backup', Role: 'backup' };
+    const backup = { ...EMPTY_VOLUMES, role: 'backup', used: 20 * 2 ** 30, available: 80 * 2 ** 30,
+      categories: [{ id: 'backup', bytes: 19 * 2 ** 30, count: 2 }, { id: 'residue', bytes: 2 ** 30, count: 1 }],
+      residues: [{ dataset: 'ndiskless/nd-rebuilding-3', kind: 'rebuilding', used: 2 ** 30, points: 1 }],
+      backup: { present: true, used: 19 * 2 ** 30, system_used: 2 ** 30, last_backup_at: '2026-11-06T03:00:00Z', pending: true,
+        items: [
+          { id: 'win', name: 'win11_25h2', dataset: 'ndiskless/nd/win', used: 11 * 2 ** 30, size: 64 * 2 ** 30, configs: 1, points: 3, state: 'newer' },
+          { id: 'cn', name: 'cn-win11', dataset: 'ndiskless/nd/cn', used: 8 * 2 ** 30, size: 64 * 2 ** 30, configs: 1, points: 1, state: 'removed' },
+        ] } };
+    stubApi({ listPools: async () => list([POOLS[0], backupPool]), listVolumes: async (_node, pool) => (pool === 'backup' ? backup : VOLUMES) });
+    renderPage();
+    await userEvent.click(await screen.findByText('backup'));
+    expect((await screen.findByText('win11_25h2')).closest('tr').textContent).toContain('数据池有变化');
+    const removed = screen.getByText('cn-win11').closest('tr');
+    expect(removed.textContent).toContain('数据池已删除');
+    expect(within(removed).queryByRole('button')).toBeNull();
+    const header = screen.getByTestId('pool-header');
+    expect(within(header).getByText('备份池')).toBeTruthy();
+    expect(within(header).getByText(/有新内容等下一轮备份/)).toBeTruthy();
+    expect(screen.getByText(/单个镜像删不掉/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /客户机盘/ })).toBeNull();
+  });
+
+  it('不再有详情弹窗，销毁存储池在磁盘与缓存里', async () => {
+    stubApi({ listVolumes: async () => VOLUMES });
+    renderPage();
+    await userEvent.click(await screen.findByText('cold'));
+    await screen.findByText('win11_25h2');
+    expect(screen.queryByRole('button', { name: /销毁存储池/ })).toBeNull();
+    await showDisks();
+    expect(await screen.findByRole('button', { name: /销毁存储池/ })).toBeTruthy();
+    expect(screen.getByText('mirror-0')).toBeTruthy();
   });
 });

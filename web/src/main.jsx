@@ -46,7 +46,7 @@ const PAGES = [
     header: { h: "服务器管理", s: "节点状态 · 无盘服务(dnsmasq / iSCSI / ZFS)管理与数据备份" } },
   { id: "storage",   label: "存储池管理",   icon: Icons.Database, component: PageStorage, shortcut: "4",
     count: (store) => store.pools.length,
-    header: { h: "存储池管理", s: "ZFS 存储池容量、读写缓存与磁盘成员管理" } },
+    header: { h: "存储池管理", s: "ZFS 存储池容量、卷、读写缓存与磁盘成员管理" } },
 
   { id: "images",    label: "镜像管理",     icon: Icons.Layers, component: PageImages, shortcut: "3",
     count: (store) => store.images.length,

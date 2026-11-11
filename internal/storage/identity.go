@@ -37,8 +37,7 @@ type IdentityLayerReleaser interface {
 	ReleaseIdentityLayers(context.Context, []string) ([]string, error)
 }
 
-// AsideHostAgent reclaims explicitly deleted image/config objects from rebuilding and diverged copies.
-// New-image dependencies and unverified file/database heads are preserved.
+// AsideHostAgent 从重建留下的旧副本里回收操作者明确删除的镜像和配置；分叉副本只由操作者确认后删。
 type AsideHostAgent interface {
 	DeleteAsideImage(ctx context.Context, imageID string, configIDs []string) error
 }

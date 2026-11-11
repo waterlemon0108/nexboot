@@ -316,9 +316,9 @@ export function RestorePointsTab({ images, imageId, configId, onPick }) {
                   <td className="t-actions"><div>
                     {!current && ready && <button className="btn" style={{ padding: "3px 8px" }} disabled={busy} onClick={() => apply(rp)} aria-label={`应用 ${name}`}>应用</button>}
                     <button className="btn" style={{ padding: "3px 8px" }} onClick={() => setModal({ kind: "detail", rp })}>详情</button>
-                    <button className="btn" style={{ padding: "3px 8px" }} disabled={!ready} onClick={() => setModal({ kind: "saveAs", rp })} aria-label={`另存为新镜像 ${name}`}>另存为新镜像</button>
-                    <button className="btn" style={{ padding: "3px 8px" }} disabled={!ready} onClick={() => setModal({ kind: "export", rp })} aria-label={`导出为镜像文件 ${name}`}>导出为镜像文件</button>
                     <MoreMenu label={`更多操作 ${name}`} items={[
+                      { label: "另存为新镜像", disabled: !ready, onClick: () => setModal({ kind: "saveAs", rp }) },
+                      { label: "导出为镜像文件", disabled: !ready, onClick: () => setModal({ kind: "export", rp }) },
                       { label: "覆盖原镜像", danger: true, disabled: !ready, onClick: () => overwrite(rp) },
                       { label: "删除", danger: true, disabled: !!lock, title: lock, onClick: () => confirmDelete(rp) },
                     ]}/>

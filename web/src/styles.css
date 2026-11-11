@@ -437,6 +437,35 @@ input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(
   margin-left: 6px;
 }
 
+/* 存储池详情的类别按钮，兼任容量条的图例 */
+.vol-cat {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--fg-mute);
+  background: var(--bg-1);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.vol-cat:hover { color: var(--fg); background: var(--bg-2); }
+.vol-cat.on { color: var(--fg); background: var(--bg-2); border-color: var(--cyan-dim); font-weight: 600; }
+.vol-cat i { width: 9px; height: 9px; border-radius: 2px; }
+.vol-cat b { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: var(--fg-mute); }
+.vol-cat-sep { width: 1px; align-self: stretch; margin: 4px; background: var(--line); }
+.vol-error {
+  padding: 24px 18px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--rose);
+  background: var(--rose-soft);
+  border: 1px solid oklch(0.55 0.14 18 / 0.5);
+  border-radius: var(--r-md);
+}
+
 /* 表格 */
 table.t { width: 100%; border-collapse: collapse; }
 table.t th, table.t td {

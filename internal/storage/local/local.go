@@ -59,6 +59,7 @@ type ZFS interface {
 	ListDatasets(ctx context.Context) ([]string, error)
 	ListSnapshots(ctx context.Context) ([]string, error)
 	ListAsideCopies(ctx context.Context, root string) ([]string, error)
+	ListPoolFacts(ctx context.Context, pool string) (storage.PoolFacts, error)
 	Used(ctx context.Context, dataset string) (int64, error)
 	SnapshotsOf(ctx context.Context, dataset string) ([]string, error)
 	ListPoolNames(ctx context.Context) ([]string, error)
@@ -114,6 +115,8 @@ type Agent struct {
 	zvolMountsFn func() []zfs.ZvolMount
 	// 测试替换点：读 /proc/self/mounts。
 	procMountsFn func() []byte
+	// filesDirFn 让测试换掉文件库目录；nil 时用 zfs.FilesDir。
+	filesDirFn func(pool string) string
 	// 非空时每个导出的 target 都要求由它派生的按 MAC CHAP 登录。启动脚本生成方
 	// 用同一密钥派生凭据，两边一致且密钥不经网络。空为演示模式。
 	chapSecret string

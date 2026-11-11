@@ -10,8 +10,8 @@ import (
 	"github.com/tianwei/diskless/internal/storage"
 )
 
-// DeleteAsideImage removes explicitly deleted image/configs from rebuilding and diverged copies.
-// New images and their required baselines, and shared file/database heads, are preserved.
+// DeleteAsideImage 从重建留下的旧副本里删掉操作者明确删除的镜像和配置，新镜像及其依赖的基线、共享的文件和数据库保留。
+// 分叉副本不碰：它可能装着失联期间写下的内容，只能由操作者确认后删。正被重建当作退路的副本也不碰。
 func (a *Agent) DeleteAsideImage(ctx context.Context, imageID string, configIDs []string) error {
 	ids := append(append([]string{}, configIDs...), imageID)
 	for _, id := range ids {
@@ -31,7 +31,7 @@ func (a *Agent) DeleteAsideImage(ctx context.Context, imageID string, configIDs 
 	}
 	var failed []error
 	for _, aside := range asides {
-		if !isAsideRoot(aside, root) {
+		if !isRebuildingRoot(aside, root) || storage.AsideInUse(aside) {
 			continue
 		}
 		targets := make([]string, 0, len(ids))
@@ -115,7 +115,7 @@ func (a *Agent) DeleteAsideImage(ctx context.Context, imageID string, configIDs 
 			targets = stuck
 		}
 		// A newly saved image must not be lost to the next whole-tree rebuilding prune.
-		if len(protected) > 0 && strings.HasPrefix(aside, root+"-rebuilding-") {
+		if len(protected) > 0 {
 			preserved := root + "-diverged-" + strings.TrimPrefix(aside, root+"-rebuilding-")
 			if err := a.zfs.Rename(ctx, aside, preserved); err != nil {
 				failed = append(failed, fmt.Errorf("请先核对新镜像所在旧副本 %s，保留改名为 %s 失败：%w", aside, preserved, err))
@@ -125,13 +125,8 @@ func (a *Agent) DeleteAsideImage(ctx context.Context, imageID string, configIDs 
 	return errors.Join(failed...)
 }
 
-// Only exact storage-generated aside roots are eligible, never arbitrary prefixes/children.
-func isAsideRoot(dataset, root string) bool {
-	for _, kind := range []string{"rebuilding", "diverged"} {
-		suffix, ok := strings.CutPrefix(dataset, root+"-"+kind+"-")
-		if ok && suffix != "" && strings.Trim(suffix, "0123456789") == "" {
-			return true
-		}
-	}
-	return false
+// isRebuildingRoot 只认存储层生成的确切名字，不认任意前缀或其子数据集。
+func isRebuildingRoot(dataset, root string) bool {
+	suffix, ok := strings.CutPrefix(dataset, root+"-rebuilding-")
+	return ok && suffix != "" && strings.Trim(suffix, "0123456789") == ""
 }

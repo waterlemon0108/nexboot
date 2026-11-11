@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tianwei/diskless/internal/control/errs"
 	"github.com/tianwei/diskless/internal/control/place"
 	"github.com/tianwei/diskless/internal/domain"
 	"github.com/tianwei/diskless/internal/storage"
@@ -23,9 +24,13 @@ type peerNode struct {
 	currentOrigin   string
 	releasedSources []string
 	releaseErr      error
+	asideErr        error
 }
 
 func (p *peerNode) DeleteAsideImage(_ context.Context, imageID string, configIDs []string) error {
+	if p.asideErr != nil {
+		return p.asideErr
+	}
 	p.asideImages = append(p.asideImages, imageID+":"+strings.Join(configIDs, ","))
 	return nil
 }
@@ -98,7 +103,7 @@ func TestDeleteImageClearsIdentityLayersAndAsideDataOnEveryNode(t *testing.T) {
 	if !slices.Equal(peer.asideImages, []string{"img-old:cfg-img-old"}) {
 		t.Fatalf("另一节点的挪开副本没清：%v", peer.asideImages)
 	}
-	if want := []string{"删镜像", "清挪开副本 img-old"}; !slices.Equal(local.events, want) {
+	if want := []string{"清挪开副本 img-old", "删镜像"}; !slices.Equal(local.events, want) {
 		t.Fatalf("本机 events = %v, want %v", local.events, want)
 	}
 }
@@ -289,7 +294,8 @@ func TestDeleteImageContactsStaleNodesForHistoricalCopies(t *testing.T) {
 	}
 }
 
-func TestDeleteImageKeepsMetadataAndCanRetryHistoricalCleanupFailure(t *testing.T) {
+// 心跳新鲜却连不上，多半是瞬时故障：拒绝且什么都不动，恢复后重试。
+func TestDeleteImageRefusesAndKeepsEverythingWhenAFreshNodeCannotBeReached(t *testing.T) {
 	ctx := context.Background()
 	st := newImageTestStore(t)
 	seedSwitchedGroup(t, st, domain.TerminalStateOffline)
@@ -298,20 +304,19 @@ func TestDeleteImageKeepsMetadataAndCanRetryHistoricalCleanupFailure(t *testing.
 	srv, _ := st.Servers().Get(ctx, "node-b")
 	workingURL := srv.APIURL
 	srv.APIURL = "http://127.0.0.1:1"
-	srv.LastSeenAt = ago(time.Hour)
 	if err := st.Servers().Update(ctx, srv); err != nil {
 		t.Fatal(err)
 	}
 	svc := ImageService{Store: st, Storage: local, Place: router}
 	err := svc.DeleteImage(ctx, "img-old")
-	if err == nil || !strings.Contains(err.Error(), "node-b") {
-		t.Fatalf("remote historical cleanup failure ignored: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "10.9.0.2") {
+		t.Fatalf("连不上的节点被忽略了：%v", err)
+	}
+	if slices.Contains(local.events, "删镜像") {
+		t.Fatalf("拒绝前已经销毁了本机数据：%v", local.events)
 	}
 	if _, err := st.Images().Get(ctx, "img-old"); err != nil {
-		t.Fatalf("image metadata lost, cannot retry: %v", err)
-	}
-	if _, err := st.Configs().Get(ctx, "cfg-img-old"); err != nil {
-		t.Fatalf("configuration metadata lost, cannot retry: %v", err)
+		t.Fatalf("镜像记录丢了，无法重试：%v", err)
 	}
 	srv.APIURL = workingURL
 	if err := st.Servers().Update(ctx, srv); err != nil {
@@ -321,7 +326,142 @@ func TestDeleteImageKeepsMetadataAndCanRetryHistoricalCleanupFailure(t *testing.
 		t.Fatal(err)
 	}
 	if !slices.Equal(peer.asideImages, []string{"img-old:cfg-img-old"}) {
-		t.Fatalf("retry did not clean node: %v", peer.asideImages)
+		t.Fatalf("重试没有清到那台节点：%v", peer.asideImages)
+	}
+}
+
+// 一台备机长期离线不能挡住删除：它的旧副本留到它回来后，在存储池详情里处理。
+func TestDeleteImageProceedsWhenAStaleNodeCannotBeReached(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	seedSwitchedGroup(t, st, domain.TerminalStateOffline)
+	local := localWithAside{imageStorageWithIdentity{&fakeImageStorage{}, &identityRecorder{}}}
+	router, _ := withPeer(t, st, local)
+	srv, _ := st.Servers().Get(ctx, "node-b")
+	srv.APIURL = "http://127.0.0.1:1"
+	srv.LastSeenAt = ago(time.Hour)
+	if err := st.Servers().Update(ctx, srv); err != nil {
+		t.Fatal(err)
+	}
+	if err := (ImageService{Store: st, Storage: local, Place: router}).DeleteImage(ctx, "img-old"); err != nil {
+		t.Fatalf("离线节点挡住了删除：%v", err)
+	}
+	if _, err := st.Images().Get(ctx, "img-old"); !errs.IsNotFound(err) {
+		t.Fatalf("镜像记录应已删除：%v", err)
+	}
+}
+
+// 心跳过期但对端应答了拒绝，说明它还活着，不能当离线跳过。
+func TestDeleteImageRefusesWhenAStaleNodeAnswersWithARefusal(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	seedSwitchedGroup(t, st, domain.TerminalStateOffline)
+	local := localWithAside{imageStorageWithIdentity{&fakeImageStorage{}, &identityRecorder{}}}
+	router, peer := withPeer(t, st, local)
+	peer.asideErr = fmt.Errorf("请先关闭或结束使用旧副本的客户机/任务 tank/run/CLIENT-1，再删除镜像 img-old")
+	srv, _ := st.Servers().Get(ctx, "node-b")
+	srv.LastSeenAt = ago(time.Hour)
+	if err := st.Servers().Update(ctx, srv); err != nil {
+		t.Fatal(err)
+	}
+	if err := (ImageService{Store: st, Storage: local, Place: router}).DeleteImage(ctx, "img-old"); err == nil {
+		t.Fatal("对端的拒绝被当成离线跳过了")
+	}
+	if slices.Contains(local.events, "删镜像") {
+		t.Fatalf("拒绝前已经销毁了本机数据：%v", local.events)
+	}
+}
+
+// 这是复制停摆的根因：先毁本机数据再报错，库行还在，下发 Incomplete 后其他备机全部拒绝复制。
+func TestDeleteImageDestroysNothingWhenAHealthyNodeRefusesToCleanItsOldCopy(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	seedSwitchedGroup(t, st, domain.TerminalStateOffline)
+	local := localWithAside{imageStorageWithIdentity{&fakeImageStorage{}, &identityRecorder{}}}
+	router, peer := withPeer(t, st, local)
+	peer.asideErr = fmt.Errorf("请先关闭或结束使用旧副本的客户机/任务 tank/run/CLIENT-1，再删除镜像 img-old")
+	err := (ImageService{Store: st, Storage: local, Place: router}).DeleteImage(ctx, "img-old")
+	if err == nil || !strings.Contains(err.Error(), "10.9.0.2") || !strings.Contains(err.Error(), "CLIENT-1") {
+		t.Fatalf("没有点名节点和占用者：%v", err)
+	}
+	if slices.Contains(local.events, "删镜像") {
+		t.Fatalf("拒绝前已经销毁了本机数据：%v", local.events)
+	}
+	if _, err := st.Images().Get(ctx, "img-old"); err != nil {
+		t.Fatalf("镜像记录丢了：%v", err)
+	}
+}
+
+// 操作者要看到该做什么，不是 dial tcp。
+func TestDeleteImageSaysWhatToDoWhenAHealthyNodeCannotBeReached(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	seedSwitchedGroup(t, st, domain.TerminalStateOffline)
+	local := localWithAside{imageStorageWithIdentity{&fakeImageStorage{}, &identityRecorder{}}}
+	router, _ := withPeer(t, st, local)
+	// 心跳还新鲜，但服务刚停：连接被拒。
+	srv, _ := st.Servers().Get(ctx, "node-b")
+	srv.APIURL = "http://127.0.0.1:1"
+	if err := st.Servers().Update(ctx, srv); err != nil {
+		t.Fatal(err)
+	}
+	err := (ImageService{Store: st, Storage: local, Place: router}).DeleteImage(ctx, "img-old")
+	if err == nil || !strings.HasPrefix(err.Error(), "请先恢复节点 10.9.0.2") || !strings.Contains(err.Error(), "还没有动") || !strings.Contains(err.Error(), "离线满 90 秒") {
+		t.Fatalf("没说清该做什么：%v", err)
+	}
+	if strings.Contains(err.Error(), "dial tcp") || strings.Contains(err.Error(), "http://") {
+		t.Fatalf("不该把连接错误原文给操作者：%v", err)
+	}
+	if slices.Contains(local.events, "删镜像") {
+		t.Fatalf("拒绝前已经销毁了本机数据：%v", local.events)
+	}
+}
+
+// 花名册里没有地址的节点从来联系不上，不能永远挡住删除。
+func TestDeleteImageIgnoresARosterNodeWithoutAnAddress(t *testing.T) {
+	ctx := context.Background()
+	st := newImageTestStore(t)
+	seedSwitchedGroup(t, st, domain.TerminalStateOffline)
+	local := localWithAside{imageStorageWithIdentity{&fakeImageStorage{}, &identityRecorder{}}}
+	router, _ := withPeer(t, st, local)
+	srv, _ := st.Servers().Get(ctx, "node-b")
+	srv.APIURL = ""
+	if err := st.Servers().Update(ctx, srv); err != nil {
+		t.Fatal(err)
+	}
+	if err := (ImageService{Store: st, Storage: local, Place: router}).DeleteImage(ctx, "img-old"); err != nil {
+		t.Fatalf("没有地址的节点挡住了删除：%v", err)
+	}
+}
+
+// cancelOnDelete 模拟操作者在销毁途中关掉页面：请求 ctx 此刻被取消。
+type cancelOnDelete struct {
+	*fakeImageStorage
+	cancel context.CancelFunc
+	sawErr error
+}
+
+func (s *cancelOnDelete) DeleteImage(ctx context.Context, id string, configIDs []string) error {
+	s.cancel()
+	s.sawErr = ctx.Err()
+	return s.fakeImageStorage.DeleteImage(ctx, id, configIDs)
+}
+
+// 取消会杀掉 zfs destroy，留下「池无库有」，效果和上面一样：其他备机拒绝复制。
+func TestDeleteImageFinishesEvenIfTheRequestIsCancelledMidway(t *testing.T) {
+	st := newImageTestStore(t)
+	seedSwitchedGroup(t, st, domain.TerminalStateOffline)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	storageAgent := &cancelOnDelete{fakeImageStorage: &fakeImageStorage{}, cancel: cancel}
+	if err := (ImageService{Store: st, Storage: storageAgent}).DeleteImage(ctx, "img-old"); err != nil {
+		t.Fatalf("页面关闭让删除半途而废：%v", err)
+	}
+	if storageAgent.sawErr != nil {
+		t.Fatalf("销毁拿到的 ctx 会被取消：%v", storageAgent.sawErr)
+	}
+	if _, err := st.Images().Get(context.Background(), "img-old"); !errs.IsNotFound(err) {
+		t.Fatalf("镜像记录应已删除：%v", err)
 	}
 }
 

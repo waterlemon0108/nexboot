@@ -150,6 +150,16 @@ type PoolService interface {
 	Destroy(context.Context, string) (ops.PoolTaskResult, error)
 }
 
+// VolumeService 回答一个池里有什么、属于谁。
+type VolumeService interface {
+	List(ctx context.Context, node, pool string) (ops.PoolVolumesResult, error)
+}
+
+// ImportFileService 删除导入目录里的文件。
+type ImportFileService interface {
+	Delete(ctx context.Context, name string) error
+}
+
 type UserService interface {
 	List(context.Context) (platform.UserListResult, error)
 	Create(context.Context, platform.CreateUserRequest) (platform.UserInfo, error)
@@ -340,6 +350,8 @@ type Services struct {
 	GroupDisks       GroupDiskService
 	Terminals        TerminalService
 	Pools            PoolService
+	Volumes          VolumeService
+	ImportFiles      ImportFileService
 	Users            UserService
 	Backups          BackupService
 	Consistency      ConsistencyService
@@ -370,6 +382,8 @@ type Services struct {
 	// NodePreserved 提供 /internal/node/preserved：本节点保留的目录副本。副本在保住它的那台（通常是备机），
 	// 而告警在写入者上跑，所以由写入者来问。
 	NodePreserved func(context.Context) ([]storage.PreservedCopy, error)
+	// NodeVolumes 提供 /internal/node/volumes：本节点一个池里的全部内容，只报事实，归类由写入者做。
+	NodeVolumes func(ctx context.Context, pool string) (storage.PoolFacts, error)
 	// NodeTasks 提供 /internal/node/tasks：本节点执行过的池任务，只记在它自己的库里。
 	NodeTasks func(context.Context) ([]domain.Task, error)
 	// ClusterPools 是逐节点收集的全部存储；为 nil 时隐藏，控制台只显示本机的数字。
@@ -534,6 +548,17 @@ func NewRouter(logger *slog.Logger, assets fs.FS, services ...Services) http.Han
 			return preservedList{Items: items}, err
 		}))
 	}
+	if svc.NodeVolumes != nil {
+		r.Get("/internal/node/volumes", nodeGuard(svc.ClusterToken, func(w http.ResponseWriter, req *http.Request) {
+			facts, err := svc.NodeVolumes(req.Context(), req.URL.Query().Get("pool"))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(facts)
+		}))
+	}
 	if svc.NodeTasks != nil {
 		r.Get("/internal/node/tasks", nodeEndpoint(svc.ClusterToken, func(ctx context.Context) (nodeTaskList, error) {
 			items, err := svc.NodeTasks(ctx)
@@ -680,6 +705,25 @@ func registerAPIRoutes(r chi.Router, svc Services, tickets *exportTickets) {
 	// 不挂在 svc.Server 下：集群存储是存储问题，概览页不论有没有接服务管理都需要它。
 	if svc.ClusterPools != nil {
 		r.Get("/api/cluster/pools", handle(svc.ClusterPools))
+	}
+	if svc.Volumes != nil {
+		r.Get("/api/volumes", handleReq(func(r *http.Request) (ops.PoolVolumesResult, error) {
+			q := r.URL.Query()
+			return svc.Volumes.List(r.Context(), q.Get("node"), q.Get("pool"))
+		}))
+	}
+	if svc.ImportFiles != nil {
+		// 文件名放路径里，审计才记得下删的是哪个文件。
+		r.Delete("/api/volumes/imports/{name}", func(w http.ResponseWriter, req *http.Request) {
+			name := chi.URLParam(req, "name")
+			// 带编码斜杠时 chi 按原始路径匹配，参数没有解码。
+			if req.URL.RawPath != "" {
+				if decoded, err := url.PathUnescape(name); err == nil {
+					name = decoded
+				}
+			}
+			finishEmpty(w, newResponder(http.StatusNoContent, nil), svc.ImportFiles.Delete(req.Context(), name))
+		})
 	}
 	if svc.ClusterDisks != nil {
 		r.Get("/api/cluster/nodes/{node}/disks", handleReq(func(r *http.Request) (ops.DiskListResult, error) {
@@ -1396,7 +1440,7 @@ func clientIP(r *http.Request) string {
 var auditModules = map[string]string{
 	"images": "镜像", "configs": "镜像", "reductions": "镜像",
 	"terminals": "终端", "groups": "分组", "group-disks": "分组",
-	"pools": "存储", "storage": "存储", "users": "用户",
+	"pools": "存储", "storage": "存储", "volumes": "存储", "users": "用户",
 	"server": "服务器", "services": "服务器", "backup": "备份",
 	"settings":     "系统参数",
 	"driver-packs": "驱动", "driver-bundles": "驱动",
